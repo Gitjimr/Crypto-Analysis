@@ -27,11 +27,44 @@ st.set_page_config(
 
 hide_menu = '''
         <style>
-        #MainMenu {visibility: hidden; }
+        #MainMenu {visibility: hidden;}
         footer {visibility: hidden;}
         </style>
-        '''
+'''
 st.markdown(hide_menu, unsafe_allow_html=True)
+
+st.markdown(
+    """
+    <style>
+    .css-1jc7ptx, .e1ewe7hr3, .viewerBadge_container__1QSob,
+    .styles_viewerBadge__1yB5_, .viewerBadge_link__1S137,
+    .viewerBadge_text__1JaDK {
+        display: none;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+st.markdown(
+    """
+    <style>
+    .st-emotion-cache-ch5dnh
+    {
+        visibility: hidden;
+    }
+    .st-emotion-cache-q16mip
+    {
+        visibility: hidden;
+    }
+    .st-emotion-cache-ztfqz8
+    {
+        visibility: hidden;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
 col1, col2 = st.columns([3, 3])
 
