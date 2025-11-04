@@ -1,0 +1,11 @@
+# Fazer carteira com, nas primeiras linhas o ativo com a % desejada para ele (o resto será considerado caixa em USD), termine a seção com um '@'. ex.: BTC 0.5
+    # Nas linhas seguintes, o ativo, as unidades adquiridas de um ativo e a data de aquisição. ex.: BTC, 0.005, 01/11/2025 
+
+    BTC 0.5
+    ETH 0.25
+    @
+    BTC, 0.1, 03/11/2025
+    BTC, 0.05, 01/11/2025
+    ETH, 3, 03/11/2025
+    USD, 1000, 01/11/2025
+    
