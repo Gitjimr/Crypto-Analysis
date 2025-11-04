@@ -36,7 +36,7 @@ import plotly.express as px
 from os import listdir
 from os.path import isfile, join
 
-import cv2  # OpenCV
+#import cv2  # OpenCV
 from PIL import Image
 
 import io
@@ -1675,6 +1675,7 @@ with st.spinner('Processando...'):
 
         st.header("🧮 Rebalanceador de Carteira")
         exibir_rebalanceamento(crypto_1d, up_, txt_manual_)
+
 
 
 
