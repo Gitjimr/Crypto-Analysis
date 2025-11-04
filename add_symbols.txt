@@ -1,0 +1,26 @@
+#  Adicione novos símbolos:
+#  Procure-os aqui e coloque o símbolo antes de '-USD': https://finance.yahoo.com/markets/crypto/all/
+
+BTC
+USD
+ETH
+SOL
+SUI20947
+LINK
+VIRTUAL
+AVAX
+AAVE
+UNI7083
+ENA
+DOT
+XAUT
+NEAR
+ONDO
+ICP
+FET
+PENDLE
+RENDER
+JUP29210
+KAS
+RAY
+MKR
