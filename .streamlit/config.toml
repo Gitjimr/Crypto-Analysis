@@ -6,3 +6,11 @@ backgroundColor="#1A1512"
 secondaryBackgroundColor="#2A211B"
 textColor="#F5EBDD"
 font="sans serif"
+
+[server]
+# Aumenta o limite máximo de upload de arquivos (padrão é 200MB)
+maxUploadSize = 500
+
+[browser]
+# Desativa o envio de métricas para o Streamlit (privacidade)
+gatherUsageStats=false
