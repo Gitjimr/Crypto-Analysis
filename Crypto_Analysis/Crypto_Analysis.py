@@ -1,1683 +1,1329 @@
-import streamlit as st
-from streamlit_drawable_canvas import st_canvas
-
-st.session_state.update(st.session_state)
-for k, v in st.session_state.items():
-    st.session_state[k] = v
 
 import os
+import re
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from io import StringIO
+from typing import Callable
 
-path = os.path.dirname(__file__)
-
-st.set_page_config(
-    page_title='CRYPTINHO',
-    layout="wide"
-)
-
-# hide_menu = '''
-#         <style>
-#         #MainMenu {visibility: hidden; }
-#         footer {visibility: hidden;}
-#         </style>
-#         '''
-# st.markdown(hide_menu, unsafe_allow_html=True)
-
-import math
-import statistics as stat
 import numpy as np
 import pandas as pd
-import re
-
-import matplotlib.pyplot as plt
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import plotly.express as px
-
-from os import listdir
-from os.path import isfile, join
-
-#import cv2  # OpenCV
-from PIL import Image
-
-import io
-from io import BytesIO
-from io import StringIO
-
-import time
-from datetime import date, datetime, timedelta
-from workadays import workdays as wd
+import plotly.graph_objects as go
 import requests
-
-from google import genai
-
-from google.genai import types
-
+import streamlit as st
 import yfinance as yf
+from plotly.subplots import make_subplots
+
+import linhas as ln
+import ml
+
+st.set_page_config(page_title="CRYPTINHO", layout="wide")
+
+# Mantém valores de widgets entre páginas (hack conhecido de apps multipágina).
+# Botões de formulário são somente leitura: regravá-los quebra o st.form.
+for _k in list(st.session_state.keys()):
+    if not str(_k).startswith("FormSubmitter:"):
+        st.session_state[_k] = st.session_state[_k]
+
+PERIODO = "max"      # baixa todo o histórico (mais dados para o ML e para EMAs longas)
+MESES_GRAFICO = 36   # período exibido por padrão nos gráficos (o mesmo do app original)
+TTL = "30m"          # tempo de vida do cache de dados de mercado
+PASTA = os.path.dirname(os.path.abspath(__file__))
+
+# Outros mercados (conferidos no Yahoo Finance em 14/10/2026).
+# EMBR3 virou EMBJ3 (nov/2025) e a JBS saiu da B3 como ação (JBSS3) e voltou como BDR (JBSS32).
+ACOES_B3 = ("ITUB4", "BBAS3", "VALE3", "CMIN3", "EQTL3", "PRIO3", "NVDC34", "MSFT34", "GOGL34", "TOTS3",
+            "MELI34", "RDOR3", "RADL3", "SLCE3", "JBSS32", "BTLG11", "HGLG11", "MULT3", "EMBJ3", "WEGE3",
+            "MDIA3", "PETR4")
+ACOES_EUA = ("JPM", "BAC", "FCX", "NEM", "NEE", "XOM", "NVDA", "MSFT", "GOOGL", "AAPL", "LLY", "UNH", "DE",
+             "ADM", "PLD", "AMT", "LMT", "RTX")
+MERCADOS = {"Cripto": "USD", "Ações B3": "BRL", "Ações EUA": "USD"}      # mercado -> moeda de cotação
 
 
-################# LEITURA #################
-
-try:
-    with open("add_symbols.txt", "r", encoding="utf-8") as f:
-        raw_lines = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
-
-    symbols = []
-    for ln in raw_lines:
-        parts = [p.strip().upper() for p in re.split(r"[,;\s]+", ln) if p.strip()]
-        symbols.extend(parts)
-
-    # Remove duplicatas mantendo ordem
-    seen = set()
-    lista_crypto = []
-    for s in symbols:
-        if s not in seen:
-            seen.add(s)
-            lista_crypto.append(s)
-
-    print("Símbolos lidos:", lista_crypto)
-
-except Exception as e:
-    print("Erro ao ler add_symbols.txt:", e)
-    lista_crypto = ["BTC", "ETH"]  # ajuste o fallback como preferir
+def ticker_yahoo(simbolo: str, mercado: str) -> str:
+    if mercado == "Ações B3":
+        return f"{simbolo}.SA"
+    if mercado == "Ações EUA":
+        return simbolo
+    return "BTC-USD" if simbolo == "USD" else f"{simbolo}-USD"
 
 
-################# FUNCTIONS #################
+# Leitura da lista de símbolos
 
-# Função para calcular RSI vetorizado
-def calculate_rsi(close, window=14):
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-
-    avg_gain = gain.rolling(window).mean()
-    avg_loss = loss.rolling(window).mean()
-
-    rs = avg_gain / (avg_loss + 1e-10)
-    return 100 - (100 / (1 + rs))
+@st.cache_data(show_spinner=False)
+def ler_simbolos(caminho: str = "add_symbols.txt") -> tuple[str, ...]:
+    for c in (caminho, os.path.join(PASTA, caminho)):
+        if os.path.exists(c):
+            with open(c, encoding="utf-8") as f:
+                txt = "\n".join(ln_ for ln_ in f if not ln_.strip().startswith("#"))
+            simbolos = [s.upper() for s in re.split(r"[,;\s]+", txt) if s.strip()]
+            return tuple(dict.fromkeys(simbolos))          # remove duplicatas, mantém ordem
+    return ("BTC", "ETH")
 
 
-########################################  OUTROS SINAIS:
+# =========================================================================== #
+# Indicadores
+# =========================================================================== #
 
-def add_reversal_indicators(df):
-    df["Williams_%R"] = calculate_williams_r(df["High"], df["Low"], df["Close"])
-    df["StochRSI"] = calculate_stoch_rsi(df["Close"])
-    df["VolumeSpike"] = calculate_volume_spike(df["Volume"])
+def calcular_adx(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14):
+    up, down = high.diff(), -low.diff()
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)     # compara com os valores ORIGINAIS
+    atr = ln.atr_wilder(high, low, close, n)
+    plus_di = 100 * plus_dm.ewm(alpha=1 / n, adjust=False).mean() / atr
+    minus_di = 100 * minus_dm.ewm(alpha=1 / n, adjust=False).mean() / atr
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10)
+    return dx.ewm(alpha=1 / n, adjust=False).mean(), plus_di, minus_di
 
-    adx, di_plus, di_minus = calculate_adx(df["High"], df["Low"], df["Close"])
-    df["ADX"] = adx
-    df["DI+"] = di_plus
-    df["DI-"] = di_minus
 
-    df["BullishDivergence"] = detect_bullish_divergence(df["Close"], df["RSI"])
-    df["BearishDivergence"] = detect_bearish_divergence(df["Close"], df["RSI"])
+def adicionar_indicadores(df: pd.DataFrame) -> pd.DataFrame:
+    """Todos os indicadores de uma vez (vetorizado, um único concat)."""
+    c, h, l, v = df["Close"], df["High"], df["Low"], df["Volume"]
+    n = len(df)
+    x = {}
+    x["RSI"] = ln.rsi_wilder(c)                       # Wilder = igual ao TradingView
+    for span in (12, 26, 50, 111, 200, 350):
+        x[f"EMA{span}"] = c.ewm(span=span, adjust=False).mean()
+    x["EMA350x2"] = 2 * x["EMA350"]
+    macd = x["EMA12"] - x["EMA26"]
+    sinal = macd.ewm(span=9, adjust=False).mean()
+    x.update(MACD=macd, MACD_Signal=sinal, MACD_Hist=macd - sinal)
 
-    return df
+    x["Price_Change"] = pc = c.diff()
+    x["OBV"] = obv = (np.sign(pc).fillna(0) * v).cumsum()
+    x["OBV_SMA20"] = obv.rolling(20).mean()
 
-def calculate_williams_r(high, low, close, window=14):
-    highest_high = high.rolling(window=window).max()
-    lowest_low = low.rolling(window=window).min()
-    return -100 * (highest_high - close) / (highest_high - lowest_low + 1e-10)
+    sma, std = c.rolling(20).mean(), c.rolling(20).std()
+    largura = 4 * std
+    x.update(SMA20=sma, STD20=std, Upper_BB=sma + 2 * std, Lower_BB=sma - 2 * std,
+             BB_Width=largura, BB_Contraction=largura.diff())
+    x["BB_Contraction_Status"] = np.where(largura.diff() < 0, "Contraindo", "Expandindo")
 
-def calculate_stoch_rsi(close, window=14):
-    rsi = calculate_rsi(close, window)
-    min_rsi = rsi.rolling(window=window).min()
-    max_rsi = rsi.rolling(window=window).max()
-    return (rsi - min_rsi) / (max_rsi - min_rsi + 1e-10)
+    hh, ll = h.rolling(14).max(), l.rolling(14).min()
+    x["Williams_%R"] = -100 * (hh - c) / (hh - ll + 1e-10)
+    r = x["RSI"]
+    rmin, rmax = r.rolling(14).min(), r.rolling(14).max()
+    x["StochRSI"] = (r - rmin) / (rmax - rmin + 1e-10)
+    x["VolumeSpike"] = v > 2 * v.rolling(20).mean()
+    x["ADX"], x["DI+"], x["DI-"] = calcular_adx(h, l, c)
+    x["ATR"] = ln.atr_wilder(h, l, c)
 
-def calculate_volume_spike(volume, window=20, threshold=2.0):
-    avg_volume = volume.rolling(window=window).mean()
-    return volume > avg_volume * threshold
+    # Divergências por pivôs (sinal ativo por 3 barras após a confirmação)
+    div = ln.divergencias(c.to_numpy(float), l.to_numpy(float), h.to_numpy(float), r.to_numpy(float))
+    for tipo, col in (("Bull", "BullishDivergence"), ("Bear", "BearishDivergence")):
+        arr = np.zeros(n, dtype=bool)
+        for conf in div.loc[div["tipo"] == tipo, "confirmacao"]:
+            arr[conf: conf + 3] = True
+        x[col] = arr
 
-def detect_bullish_divergence(close, rsi, lookback=14):
-    signal = pd.Series(False, index=close.index)
-    for i in range(lookback, len(close)):
-        # Encontra mínimos locais no preço e RSI, ignorando NaNs
-        price_lows = close[i - lookback:i + 1].dropna()
-        rsi_lows = rsi[i - lookback:i + 1].dropna()
+    # Fibonacci do último ano (constantes; guardadas como colunas por compatibilidade)
+    ano = df.loc[df.index > df.index.max() - pd.DateOffset(years=1)]
+    hi1, lo1 = float(ano["High"].max()), float(ano["Low"].min())
+    amp = hi1 - lo1
+    for k, f in {"23.6%": .236, "38.2%": .382, "50%": .5, "61.8%": .618, "78.6%": .786}.items():
+        x[f"Fib_{k}"] = hi1 - amp * f
+    for k, f in {"61.8%": .618, "100%": 1.0, "161.8%": 1.618, "261.8%": 2.618, "423.6%": 4.236}.items():
+        x[f"Ext_{k}"] = hi1 + amp * f
 
-        # Garante que as janelas não estão vazias
-        if price_lows.empty or rsi_lows.empty:
-            continue
+    return pd.concat([df, pd.DataFrame(x, index=df.index)], axis=1)
 
-        min_price_idx = price_lows.idxmin()
-        min_rsi_idx = rsi_lows.idxmin()
 
-        # Verifica se o mínimo do preço é anterior ao mínimo do RSI
-        if (min_price_idx < min_rsi_idx and
-            close[min_rsi_idx] < close[min_price_idx] and
-            rsi[min_rsi_idx] > rsi[min_price_idx]):
-            signal[i] = True
+# Dados
 
-    return signal
+OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 
-def detect_bearish_divergence(close, rsi, lookback=14):
-    signal = pd.Series(False, index=close.index)
-    for i in range(lookback, len(close)):
-        # Encontra máximos locais no preço e RSI
-        price_highs = close[i-lookback:i+1].dropna()
-        rsi_highs = rsi[i-lookback:i+1].dropna()
 
-        # Garante que as janelas não estão vazias
-        if price_highs.empty or rsi_highs.empty:
-            continue
-
-        max_price_idx = price_highs.idxmax()
-        max_rsi_idx = rsi_highs.idxmax()
-
-        # Verifica se o máximo do preço é anterior ao máximo do RSI
-        if (max_price_idx < max_rsi_idx and
-            close[max_rsi_idx] > close[max_price_idx] and
-            rsi[max_rsi_idx] < rsi[max_price_idx]):
-            signal[i] = True
-
-    return signal
-
-def calculate_adx(high, low, close, window=14):
-    # Cálculo do DM+ e DM- usando Pandas Series
-    plus_dm = high.diff()
-    minus_dm = -low.diff()  # Movimento negativo
-
-    # Mantemos como Series do Pandas
-    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
-    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
-
-    # True Range (TR)
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-    # Suavização com EMA (mantendo como Series)
-    alpha = 1 / window
-    atr = tr.ewm(alpha=alpha, adjust=False).mean()
-    plus_di = 100 * (plus_dm.ewm(alpha=alpha, adjust=False).mean() / atr)
-    minus_di = 100 * (minus_dm.ewm(alpha=alpha, adjust=False).mean() / atr)
-
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
-    adx = dx.ewm(alpha=alpha, adjust=False).mean()
-
-    return adx, plus_di, minus_di
-
-########################################
-
-# Função para baixar e processar dados
-def fetch_crypto_data(symbols, periodo, freq="1d", data_maxima=None):
-
-    # Define a data máxima como hoje se não for fornecida
-    if data_maxima is None:
-        data_maxima = pd.Timestamp.today().normalize()
-    else:
-        data_maxima = pd.to_datetime(data_maxima)
-
-    data = yf.download([f"{sym}-USD" for sym in symbols if sym != "USD"], period=periodo, group_by="ticker")
-    results = {}
-
-    for sym in symbols:
-
-        # Se o símbolo for "USD", invertemos os valores de BTC-USD para representar USD-BTC
-        if sym == "USD":
-            df = data["BTC-USD"].reset_index()
-            cols_to_invert = ["Open", "High", "Low", "Close"]
-            # Inverte os preços: 1 / preço
-            df[cols_to_invert] = 1 / df[cols_to_invert]
+@st.cache_data(ttl=TTL, show_spinner=False)
+def baixar_ohlc(simbolos: tuple[str, ...], periodo: str, mercado: str = "Cripto") -> dict[str, pd.DataFrame]:
+    """Um único download para todos os ativos do mercado."""
+    tickers = sorted({ticker_yahoo(s, mercado) for s in simbolos})
+    raw = yf.download(tickers, period=periodo, group_by="ticker", auto_adjust=False,
+                      progress=False, threads=True)
+    out = {}
+    for s in simbolos:
+        t = ticker_yahoo(s, mercado)
+        if isinstance(raw.columns, pd.MultiIndex):
+            if t not in raw.columns.get_level_values(0):
+                continue
+            df = raw[t]
         else:
-            df = data[f"{sym}-USD"].reset_index()
-
-
-        # Filtra os dados até a data máxima
-        df = df[df['Date'] <= data_maxima]
-
-
-        # # Imprimir a primeira e última data disponível
-        # if not df.empty:
-        #     first_date = df['Date'].iloc[0]
-        #     last_date = df['Date'].iloc[-1]
-        #     print(f"{sym}: Primeira data = {first_date.date()}, Última data = {last_date.date()}")
-        # else:
-        #     print(f"{sym}: Dados não disponíveis.")
-
-
-
-        # Se for semanal, pega apenas de 7 em 7 dias
-        if freq == "1s":
-            df = df.iloc[::7].reset_index(drop=True)
-
-        # Se for mensal, pega apenas o último dado de cada mês
-        elif freq == "1m":
-            df["Month"] = df["Date"].dt.to_period("M")  # Cria coluna de mês
-            df = df.groupby("Month").last().reset_index()  # Pega o último registro de cada mês
-
-        df["RSI"] = calculate_rsi(df["Close"])
-        df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
-        df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
-        df["EMA350"] = df["Close"].ewm(span=350, adjust=False).mean()
-        df["EMA350x2"] = df["Close"].ewm(span=350, adjust=False).mean() * 2
-        df["EMA111"] = df["Close"].ewm(span=111, adjust=False).mean()
-        df["EMA26"] = df["Close"].ewm(span=26, adjust=False).mean()
-        df["EMA12"] = df["Close"].ewm(span=12, adjust=False).mean()
-        df["MACD"] = df["EMA12"] - df["EMA26"]
-        df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
-        df["MACD_Hist"] = df["MACD"] - df["MACD_Signal"]
-
-        # Cálculo do OBV (On-Balance Volume)
-        df["Price_Change"] = df["Close"].diff()  # Diferença entre fechamentos
-        df["OBV"] = 0  # Inicializa OBV
-        df.loc[df["Price_Change"] > 0, "OBV"] = df["Volume"]  # Se preço sobe, soma volume
-        df.loc[df["Price_Change"] < 0, "OBV"] = -df["Volume"]  # Se preço cai, subtrai volume
-        df["OBV"] = df["OBV"].cumsum()  # Soma cumulativa para manter o OBV atualizado
-
-        # Cálculo das Bollinger Bands
-        df["SMA20"] = df["Close"].rolling(window=20).mean()  # Média móvel simples de 20 períodos
-        df["STD20"] = df["Close"].rolling(window=20).std()  # Desvio padrão de 20 períodos
-        df["Upper_BB"] = df["SMA20"] + (df["STD20"] * 2)  # Banda superior
-        df["Lower_BB"] = df["SMA20"] - (df["STD20"] * 2)  # Banda inferior
-        ## Cálculo da largura das Bollinger Bands (Distância entre as bandas)
-        df["BB_Width"] = df["Upper_BB"] - df["Lower_BB"]
-        ## Verificar se as bandas estão se estreitando (contraindo) ou expandindo
-        df["BB_Contraction"] = df["BB_Width"].diff()  # Diferença entre a largura atual e a anterior
-        ## Se a largura está diminuindo, as bandas estão se contraindo (estreitando)
-        df["BB_Contraction_Status"] = df["BB_Contraction"].apply(lambda x: "Contraindo" if x < 0 else "Expandindo")
-
-        # Sinais adicionais
-        df = add_reversal_indicators(df)
-
-        # Cálculo das retrações de Fibonacci (High e Low do último ano)
-        # Pegamos o último ano de dados
-        one_year_data = df[df["Date"] > df["Date"].max() - pd.DateOffset(years=1)]
-
-        # Encontrar o High e Low do último ano
-        high_1y = one_year_data["High"].max()
-        low_1y = one_year_data["Low"].min()
-
-        # Calcular as retrações de Fibonacci
-        fibonacci_levels = {
-            "23.6%": high_1y - (high_1y - low_1y) * 0.236,
-            "38.2%": high_1y - (high_1y - low_1y) * 0.382,
-            "50%": high_1y - (high_1y - low_1y) * 0.5,
-            "61.8%": high_1y - (high_1y - low_1y) * 0.618,
-            "78.6%": high_1y - (high_1y - low_1y) * 0.786,
-        }
-
-        # Adicionando as retrações de Fibonacci como novas colunas
-        for level, value in fibonacci_levels.items():
-            df[f"Fib_{level}"] = value
-
-        # Cálculo das expansões de Fibonacci
-        fibonacci_extensions = {
-            "61.8%": high_1y + (high_1y - low_1y) * 0.618,
-            "100%": high_1y + (high_1y - low_1y) * 1.0,
-            "161.8%": high_1y + (high_1y - low_1y) * 1.618,
-            "261.8%": high_1y + (high_1y - low_1y) * 2.618,
-            "423.6%": high_1y + (high_1y - low_1y) * 4.236,
-        }
-
-        # Adicionando as expansões de Fibonacci como novas colunas
-        for level, value in fibonacci_extensions.items():
-            df[f"Ext_{level}"] = value
-
-        results[sym] = df
-
-    return results
-
-########################################  ANALISAR ATIVOS:
-
-def analisar_sinais_cripto(df_analise, nome_periodo_analise, lista_crypto,
-                           crypto_1d, crypto_1w, crypto_1m,
-                           lista_crypto_25, lista_crypto_50, lista_crypto_100):
-    """
-    Analisa sinais de compra e venda para uma lista de criptomoedas
-    com base em um DataFrame de um período específico (diário, semanal, etc.),
-    e também utiliza dados de RSI de outros períodos.
-
-    Args:
-        df_analise (pd.DataFrame): DataFrame principal para análise (ex: dados semanais).
-        nome_periodo_analise (str): Nome do período que está sendo analisado (ex: "Semanal (1S)").
-        lista_crypto (list): Lista de tickers das criptomoedas.
-        crypto_1d (pd.DataFrame): DataFrame com dados diários (usado para RSI 1D e variação de preço 1S).
-        crypto_1w (pd.DataFrame): DataFrame com dados semanais (usado para RSI 1S).
-        crypto_1m (pd.DataFrame): DataFrame com dados mensais (usado para RSI 1M).
-        lista_crypto_25 (list): Lista de tokens do Top 25.
-        lista_crypto_50 (list): Lista de tokens do Top 50.
-        lista_crypto_100 (list): Lista de tokens do Top 100.
-        pd (module): Módulo pandas.
-
-    Returns:
-        tuple: Contendo as strings de sinais, DataFrames de resumo e variação de preço.
-    """
-
-    variacoes_preco_1S_str = "" # Renomeado para evitar conflito de nome com a string externa
-
-    # Inicializando as mensagens com formatação HTML permitida pelo Telegram
-    sinais_compra_geral_ = f"<b>* SINAIS DE COMPRA ({nome_periodo_analise}): *</b>\n\n"
-    sinais_venda_geral_ = f"<b>* SINAIS DE VENDA ({nome_periodo_analise}): *</b>\n\n"
-
-    sinais_compra_25_ = f"<b>* SINAIS DE COMPRA TOP 25 ({nome_periodo_analise}): *</b>\n\n"
-    sinais_venda_25_ = f"<b>* SINAIS DE VENDA TOP 25 ({nome_periodo_analise}): *</b>\n\n"
-
-    sinais_compra_50_ = f"<b>* SINAIS DE COMPRA TOP 50 ({nome_periodo_analise}): *</b>\n\n"
-    sinais_venda_50_ = f"<b>* SINAIS DE VENDA TOP 50 ({nome_periodo_analise}): *</b>\n\n"
-
-    sinais_compra_100_ = f"<b>* SINAIS DE COMPRA TOP 100 ({nome_periodo_analise}): *</b>\n\n" # Corrigido de TOP 50 para TOP 100
-    sinais_venda_100_ = f"<b>* SINAIS DE VENDA TOP 100 ({nome_periodo_analise}): *</b>\n\n" # Corrigido de TOP 50 para TOP 100
-
-
-    df_buy_sell_ratio = pd.DataFrame(columns=["Token", f"Buy/Sell Ratio"])
-    df_agregado_compra_venda = pd.DataFrame(columns=["Token", f"Compra x Venda"])
-
-
-    for token in lista_crypto:
-
-        sinais_compra_token = "" # Renomeado para escopo local
-        sinais_venda_token = ""  # Renomeado para escopo local
-
-        # Destaque do token: negrito e sublinhado
-        token_destacado = f"<b><u>{token}</u></b>"
-
-        # Inicializando os contadores
-        razao_compra = 0
-        total_sinais_compra = 9 + 8 # Mantido conforme original, ajuste se os tipos de sinais mudarem
-
-        razao_venda = 0
-        total_sinais_venda = 11 + 8 # Mantido conforme original
-
-        # -------------- SINAIS DE COMPRA (🟢) --------------
-        # EMA50 > EMA200 (Bullish)
-        if df_analise[token]['EMA200'].iloc[-1] < df_analise[token]['EMA50'].iloc[-1]:
-            razao_compra += 1
-            rc = f"<b>[{razao_compra}/{total_sinais_compra}]</b>"
-            sinais_compra_token += (f"🟢 {token_destacado} ({nome_periodo_analise}): <i>EMA200</i> (<code>{df_analise[token]['EMA200'].iloc[-1]}</code>) menor que "
-                                  f"<i>EMA50</i> (<code>{df_analise[token]['EMA50'].iloc[-1]}</code>) → <b>Bull</b> {rc}\n")
-            # Condição: Preço abaixo das EMAs 50, 111 e 200, mas acima da EMA350
-            if (df_analise[token]['Close'].iloc[-1] < df_analise[token]['EMA50'].iloc[-1] and
-                df_analise[token]['Close'].iloc[-1] < df_analise[token]['EMA111'].iloc[-1] and
-                df_analise[token]['Close'].iloc[-1] <= df_analise[token]['EMA200'].iloc[-1] and
-                df_analise[token]['Close'].iloc[-1] >= df_analise[token]['EMA350'].iloc[-1]):
-                razao_compra += 1
-                rc = f"<b>[{razao_compra}/{total_sinais_compra}]</b>"
-                sinais_compra_token += (f"🔽 {token_destacado} ({nome_periodo_analise}): Preço abaixo das <i>EMA's 50, 111 e 200</i>, mas acima do suporte da "
-                                      f"<i>EMA350</i> (<code>{df_analise[token]['EMA350'].iloc[-1]}</code>) {rc}\n")
-
-        # RSI em sobrevenda (≤ 30) - Referências específicas mantidas
-        if crypto_1d[token]['RSI'].iloc[-1] <= 30:
-            razao_compra += 1
-            rc = f"<b>[{razao_compra}/{total_sinais_compra}]</b>"
-            sinais_compra_token += (f"📉 {token_destacado}: RSI <b>1D</b> em sobrevenda (<code>{crypto_1d[token]['RSI'].iloc[-1]:.2f}</code>) {rc}\n")
-        if crypto_1w[token]['RSI'].iloc[-1] <= 30: # Supondo que crypto_1w está disponível
-            razao_compra += 1
-            rc = f"<b>[{razao_compra}/{total_sinais_compra}]</b>"
-            sinais_compra_token += (f"📉 {token_destacado}: RSI <b>1S</b> em sobrevenda (<code>{crypto_1w[token]['RSI'].iloc[-1]:.2f}</code>) {rc}\n")
-        if crypto_1m[token]['RSI'].iloc[-1] <= 30: # Supondo que crypto_1m está disponível
-            razao_compra += 1
-            rc = f"<b>[{razao_compra}/{total_sinais_compra}]</b>"
-            sinais_compra_token += (f"📉 {token_destacado}: RSI <b>1M</b> em sobrevenda (<code>{crypto_1m[token]['RSI'].iloc[-1]:.2f}</code>) {rc}\n")
-
-        # MACD positivo (histograma > 0)
-        if df_analise[token]['MACD_Hist'].iloc[-1] > 0:
-            razao_compra += 1
-            rc = f"<b>[{razao_compra}/{total_sinais_compra}]</b>"
-            sinais_compra_token += (f"📈 {token_destacado} ({nome_periodo_analise}): MACD acima da linha de sinal → <b>Bull</b> {rc}\n")
-
-        # OBV e Price Change
-        if df_analise[token]['OBV'].iloc[-1] > 0:
-            razao_compra += 1
-            rc = f"<b>[{razao_compra}/{total_sinais_compra}]</b>"
-            if df_analise[token]['Price_Change'].iloc[-1] > 0:
-                sinais_compra_token += (f"📊 {token_destacado} ({nome_periodo_analise}): OBV e Price Change subindo → Tendência de alta confiável {rc}\n")
-            elif df_analise[token]['Price_Change'].iloc[-1] < 0:
-                sinais_compra_token += (f"🔽 {token_destacado} ({nome_periodo_analise}): OBV subindo e Price Change caindo → Possível suporte/recuperação {rc}\n")
-
-        # Preço abaixo da Banda de Bollinger Inferior
-        if df_analise[token]['Lower_BB'].iloc[-1] > df_analise[token]['Close'].iloc[-1]:
-            razao_compra += 1
-            rc = f"<b>[{razao_compra}/{total_sinais_compra}]</b>"
-            if df_analise[token]["BB_Contraction_Status"].iloc[-1] == "Contraindo":
-                sinais_compra_token += (f"📉 {token_destacado} ({nome_periodo_analise}): Preço abaixo da banda de Bollinger inferior (<code>{df_analise[token]['Lower_BB'].iloc[-1]}</code>) → "
-                                      f"Pressão de compra, contraindo → Grande movimento ruptivo se aproximando {rc}\n")
-            else:
-                sinais_compra_token += (f"📉 {token_destacado} ({nome_periodo_analise}): Preço abaixo da banda de Bollinger inferior (<code>{df_analise[token]['Lower_BB'].iloc[-1]}</code>) → "
-                                      f"Pressão de compra, expandindo → Alta volatilidade {rc}\n")
-
-        # Preço entre retrações de Fibonacci de 61.8% e 38,2% (Golden Pocket)
-        if (df_analise[token]['Fib_38.2%'].iloc[-1] >= df_analise[token]['Close'].iloc[-1] and
-            df_analise[token]['Close'].iloc[-1] >= df_analise[token]['Fib_61.8%'].iloc[-1]):
-            razao_compra += 1
-            rc = f"<b>[{razao_compra}/{total_sinais_compra}]</b>"
-            sinais_compra_token += (f"🔺 {token_destacado} ({nome_periodo_analise}): Preço entre retrações de Fibo de 38.2% (<code>{df_analise[token]['Fib_38.2%'].iloc[-1]}</code>) (Compra arrojada)"
-                                  f"e 61,8% (<code>{df_analise[token]['Fib_61.8%'].iloc[-1]}</code>) (Golden Pocket - Compra conservadora) {rc}\n")
-
-        # OUTROS SINAIS DE COMPRA:
-        if df_analise[token]['Williams_%R'].iloc[-1] <= -80:
-            razao_compra += 1
-            rc = f"<b>[{razao_compra}/{total_sinais_compra}]</b>"
-            sinais_compra_token += (f"🟢 {token_destacado} ({nome_periodo_analise}): Williams %R (<code>{df_analise[token]['Williams_%R'].iloc[-1]:.2f}</code>) <= -80 (Oversold) {rc}\n")
-
-        if df_analise[token]['StochRSI'].iloc[-1] <= 0.2:
-            razao_compra += 1
-            rc = f"<b>[{razao_compra}/{total_sinais_compra}]</b>"
-            sinais_compra_token += (f"🟢 {token_destacado} ({nome_periodo_analise}): StochRSI (<code>{df_analise[token]['StochRSI'].iloc[-1]:.2f}</code>) <= 0.2 (Oversold) {rc}\n")
-
-        if df_analise[token]['VolumeSpike'].iloc[-1] and df_analise[token]['Close'].iloc[-1] > df_analise[token]['Close'].iloc[-2]:
-            razao_compra += 1
-            rc = f"<b>[{razao_compra}/{total_sinais_compra}]</b>"
-            sinais_compra_token += (f"🟢 {token_destacado} ({nome_periodo_analise}): Volume Spike com preço subindo (Acumulação) {rc}\n")
-
-        if df_analise[token]['ADX'].iloc[-1] > 25 and df_analise[token]['DI+'].iloc[-1] > df_analise[token]['DI-'].iloc[-1]:
-            razao_compra += 1
-            rc = f"<b>[{razao_compra}/{total_sinais_compra}]</b>"
-            sinais_compra_token += (f"🟢 {token_destacado} ({nome_periodo_analise}): ADX (<code>{df_analise[token]['ADX'].iloc[-1]:.2f}</code>) > 25 e DI+ > DI- (Tendência de Alta) {rc}\n")
-
-        if df_analise[token]['BullishDivergence'].iloc[-1]:
-            razao_compra += 1
-            rc = f"<b>[{razao_compra}/{total_sinais_compra}]</b>"
-            sinais_compra_token += (f"🟢 {token_destacado} ({nome_periodo_analise}): Divergência de Alta detectada {rc}\n")
-
-        if (df_analise[token]['DI+'].iloc[-1] > df_analise[token]['DI-'].iloc[-1] and
-            df_analise[token]['DI+'].iloc[-2] < df_analise[token]['DI-'].iloc[-2]):
-            razao_compra += 1
-            rc = f"<b>[{razao_compra}/{total_sinais_compra}]</b>"
-            sinais_compra_token += (f"🟢 {token_destacado} ({nome_periodo_analise}): DI+ cruzou acima do DI- (Mudança de Tendência) {rc}\n")
-
-        if (df_analise[token]['Williams_%R'].iloc[-1] > -80 and
-            df_analise[token]['Williams_%R'].iloc[-2] <= -80):
-            razao_compra += 1
-            rc = f"<b>[{razao_compra}/{total_sinais_compra}]</b>"
-            sinais_compra_token += (f"🟢 {token_destacado} ({nome_periodo_analise}): Williams %R cruzando acima de -80 (Saindo de Oversold) {rc}\n")
-
-        if (df_analise[token]['StochRSI'].iloc[-1] > 0.2 and
-            df_analise[token]['StochRSI'].iloc[-2] <= 0.2):
-            razao_compra += 1
-            rc = f"<b>[{razao_compra}/{total_sinais_compra}]</b>"
-            sinais_compra_token += (f"🟢 {token_destacado} ({nome_periodo_analise}): StochRSI cruzando acima de 0.2 (Momentum Positivo) {rc}\n")
-
-        # -------------- SINAIS DE VENDA (🔴) --------------
-        # EMA50 < EMA200 (Bearish)
-        if df_analise[token]['EMA200'].iloc[-1] > df_analise[token]['EMA50'].iloc[-1]:
-            razao_venda += 1
-            rv = f"<b>[{razao_venda}/{total_sinais_venda}]</b>"
-            sinais_venda_token += (f"🔴 {token_destacado} ({nome_periodo_analise}): <i>EMA200</i> (<code>{df_analise[token]['EMA200'].iloc[-1]}</code>) > "
-                                 f"<i>EMA50</i> (<code>{df_analise[token]['EMA50'].iloc[-1]}</code>) → <b>Bear</b> {rv}\n")
-
-        # Preço acima de todas as EMAs
-        if (df_analise[token]['Close'].iloc[-1] > df_analise[token]['EMA50'].iloc[-1] and
-            df_analise[token]['Close'].iloc[-1] > df_analise[token]['EMA111'].iloc[-1] and
-            df_analise[token]['Close'].iloc[-1] > df_analise[token]['EMA200'].iloc[-1] and
-            df_analise[token]['Close'].iloc[-1] > df_analise[token]['EMA350'].iloc[-1]):
-            razao_venda += 1
-            rv = f"<b>[{razao_venda}/{total_sinais_venda}]</b>"
-            sinais_venda_token += (f"🔴 {token_destacado} ({nome_periodo_analise}): Preço acima das <i>EMA's 50, 111 e 200</i> e acima da <i>EMA350</i> (suporte) {rv}\n")
-
-        # Preço acima da EMA350x2
-        if df_analise[token]['Close'].iloc[-1] > df_analise[token]['EMA350x2'].iloc[-1]:
-            razao_venda += 1
-            rv = f"<b>[{razao_venda}/{total_sinais_venda}]</b>"
-            sinais_venda_token += (f"🔴 {token_destacado} ({nome_periodo_analise}): Preço acima da <i>EMA350 x 2</i> (<code>{df_analise[token]['EMA350x2'].iloc[-1]}</code>) → "
-                                 f"Atenção ao cruzamento com <i>EMA111</i> (<code>{df_analise[token]['EMA111'].iloc[-1]}</code>) {rv}\n")
-
-        # Pi Cycle Top (alerta)
-        if (df_analise[token]['EMA111'].iloc[-1] / df_analise[token]['EMA350x2'].iloc[-1]) >= 0.9: # Divisão por zero pode ocorrer se EMA350x2 for zero
-            razao_venda += 1
-            rv = f"<b>[{razao_venda}/{total_sinais_venda}]</b>"
-            sinais_venda_token += (f"⚠️ {token_destacado} ({nome_periodo_analise}): Pi Cycle Top em <i>ZONA DE ALERTA</i> → Topo em formação com "
-                                 f"<i>EMA350x2</i> (<code>{df_analise[token]['EMA350x2'].iloc[-1]}</code>) e "
-                                 f"<i>EMA111</i> (<code>{df_analise[token]['EMA111'].iloc[-1]}</code>) se cruzando {rv}\n")
-
-        # RSI em sobrecompra (≥ 70) - Referências específicas mantidas
-        if crypto_1d[token]['RSI'].iloc[-1] >= 70:
-            razao_venda += 1
-            rv = f"<b>[{razao_venda}/{total_sinais_venda}]</b>"
-            sinais_venda_token += (f"📈 {token_destacado}: RSI <b>1D</b> em sobrecompra (<code>{crypto_1d[token]['RSI'].iloc[-1]:.2f}</code>) {rv}\n")
-        if crypto_1w[token]['RSI'].iloc[-1] >= 70: # Supondo que crypto_1w está disponível
-            razao_venda += 1
-            rv = f"<b>[{razao_venda}/{total_sinais_venda}]</b>"
-            sinais_venda_token += (f"📈 {token_destacado}: RSI <b>1S</b> em sobrecompra (<code>{crypto_1w[token]['RSI'].iloc[-1]:.2f}</code>) {rv}\n")
-        if crypto_1m[token]['RSI'].iloc[-1] >= 70: # Supondo que crypto_1m está disponível
-            razao_venda += 1
-            rv = f"<b>[{razao_venda}/{total_sinais_venda}]</b>"
-            sinais_venda_token += (f"📈 {token_destacado}: RSI <b>1M</b> em sobrecompra (<code>{crypto_1m[token]['RSI'].iloc[-1]:.2f}</code>) {rv}\n")
-
-        # MACD negativo (histograma < 0)
-        if df_analise[token]['MACD_Hist'].iloc[-1] < 0:
-            razao_venda += 1
-            rv = f"<b>[{razao_venda}/{total_sinais_venda}]</b>"
-            sinais_venda_token += (f"📉 {token_destacado} ({nome_periodo_analise}): MACD abaixo da linha de sinal → <b>Bear</b> {rv}\n")
-
-        # OBV negativo e Price Change
-        if df_analise[token]['OBV'].iloc[-1] < 0:
-            razao_venda += 1
-            rv = f"<b>[{razao_venda}/{total_sinais_venda}]</b>"
-            if df_analise[token]['Price_Change'].iloc[-1] > 0:
-                sinais_venda_token += (f"🔻 {token_destacado} ({nome_periodo_analise}): OBV caindo e Price Change subindo → Divergência → Alerta de reversão! {rv}\n")
-            elif df_analise[token]['Price_Change'].iloc[-1] < 0:
-                sinais_venda_token += (f"🔻 {token_destacado} ({nome_periodo_analise}): OBV e Price Change caindo → Tendência de baixa confirmada {rv}\n")
-
-        # Preço acima da Banda de Bollinger Superior (originalmente estava como "abaixo da inferior" na seção de venda, corrigido para lógica de venda)
-        if df_analise[token]['Upper_BB'].iloc[-1] < df_analise[token]['Close'].iloc[-1]: # Corrigido: venda se preço acima da banda superior
-            razao_venda += 1
-            rv = f"<b>[{razao_venda}/{total_sinais_venda}]</b>"
-            # A descrição original para este sinal de VENDA parecia copiada da COMPRA. Ajustei para um contexto de venda.
-            if df_analise[token]["BB_Contraction_Status"].iloc[-1] == "Contraindo":
-                 sinais_venda_token += (f"📈 {token_destacado} ({nome_periodo_analise}): Preço acima da banda de Bollinger superior (<code>{df_analise[token]['Upper_BB'].iloc[-1]}</code>) → "
-                                   f"Pressão de venda, contraindo → Grande movimento ruptivo se aproximando {rv}\n")
-            else:
-                 sinais_venda_token += (f"📈 {token_destacado} ({nome_periodo_analise}): Preço acima da banda de Bollinger superior (<code>{df_analise[token]['Upper_BB'].iloc[-1]}</code>) → "
-                                   f"Pressão de venda, expandindo → Alta volatilidade {rv}\n")
-
-
-        # Preço abaixo da retração de Fibonacci de 78.6%
-        if df_analise[token]['Fib_78.6%'].iloc[-1] > df_analise[token]['Close'].iloc[-1]:
-            razao_venda += 1
-            rv = f"<b>[{razao_venda}/{total_sinais_venda}]</b>"
-            sinais_venda_token += (f"📉 {token_destacado} ({nome_periodo_analise}): Preço abaixo da retração de Fibo de 78.6% (<code>{df_analise[token]['Fib_78.6%'].iloc[-1]}</code>) {rv}\n")
-
-        # Preço entre as extensões de Fibonacci de 100% e 161.8%
-        if (df_analise[token]['Ext_161.8%'].iloc[-1] >= df_analise[token]['Close'].iloc[-1] and
-            df_analise[token]['Close'].iloc[-1] >= df_analise[token]['Ext_100%'].iloc[-1]):
-            razao_venda += 1
-            rv = f"<b>[{razao_venda}/{total_sinais_venda}]</b>"
-            sinais_venda_token += (f"📉 {token_destacado} ({nome_periodo_analise}): Preço entre as extensões de Fibo de 100% (<code>{df_analise[token]['Ext_100%'].iloc[-1]}</code>) "
-                                 f"e 161,8% (<code>{df_analise[token]['Ext_161.8%'].iloc[-1]}</code>) {rv}\n")
-
-        # OUTROS SINAIS DE VENDA:
-        if df_analise[token]['Williams_%R'].iloc[-1] >= -20:
-            razao_venda += 1
-            rv = f"<b>[{razao_venda}/{total_sinais_venda}]</b>"
-            sinais_venda_token += (f"🔴 {token_destacado} ({nome_periodo_analise}): Williams %R (<code>{df_analise[token]['Williams_%R'].iloc[-1]:.2f}</code>) >= -20 (Overbought) {rv}\n")
-
-        if df_analise[token]['StochRSI'].iloc[-1] >= 0.8:
-            razao_venda += 1
-            rv = f"<b>[{razao_venda}/{total_sinais_venda}]</b>"
-            sinais_venda_token += (f"🔴 {token_destacado} ({nome_periodo_analise}): StochRSI (<code>{df_analise[token]['StochRSI'].iloc[-1]:.2f}</code>) >= 0.8 (Overbought) {rv}\n")
-
-        if df_analise[token]['VolumeSpike'].iloc[-1] and df_analise[token]['Close'].iloc[-1] < df_analise[token]['Close'].iloc[-2]:
-            razao_venda += 1
-            rv = f"<b>[{razao_venda}/{total_sinais_venda}]</b>"
-            sinais_venda_token += (f"🔴 {token_destacado} ({nome_periodo_analise}): Volume Spike com preço caindo (Distribuição) {rv}\n")
-
-        if df_analise[token]['ADX'].iloc[-1] > 25 and df_analise[token]['DI-'].iloc[-1] > df_analise[token]['DI+'].iloc[-1]:
-            razao_venda += 1
-            rv = f"<b>[{razao_venda}/{total_sinais_venda}]</b>"
-            sinais_venda_token += (f"🔴 {token_destacado} ({nome_periodo_analise}): ADX (<code>{df_analise[token]['ADX'].iloc[-1]:.2f}</code>) > 25 e DI- > DI+ (Tendência de Baixa) {rv}\n")
-
-        if (df_analise[token]['DI-'].iloc[-1] > df_analise[token]['DI+'].iloc[-1] and
-            df_analise[token]['DI-'].iloc[-2] < df_analise[token]['DI+'].iloc[-2]):
-            razao_venda += 1
-            rv = f"<b>[{razao_venda}/{total_sinais_venda}]</b>"
-            sinais_venda_token += (f"🔴 {token_destacado} ({nome_periodo_analise}): DI- cruzou acima do DI+ (Mudança de Tendência) {rv}\n")
-
-        if (df_analise[token]['Williams_%R'].iloc[-1] < -20 and
-            df_analise[token]['Williams_%R'].iloc[-2] >= -20):
-            razao_venda += 1
-            rv = f"<b>[{razao_venda}/{total_sinais_venda}]</b>"
-            sinais_venda_token += (f"🔴 {token_destacado} ({nome_periodo_analise}): Williams %R cruzando abaixo de -20 (Saindo de Overbought) {rv}\n")
-
-        if (df_analise[token]['StochRSI'].iloc[-1] < 0.8 and
-            df_analise[token]['StochRSI'].iloc[-2] >= 0.8):
-            razao_venda += 1
-            rv = f"<b>[{razao_venda}/{total_sinais_venda}]</b>"
-            sinais_venda_token += (f"🔴 {token_destacado} ({nome_periodo_analise}): StochRSI cruzando abaixo de 0.8 (Momentum Negativo) {rv}\n")
-
-        if df_analise[token]['BearishDivergence'].iloc[-1]:
-            razao_venda += 1
-            rv = f"<b>[{razao_venda}/{total_sinais_venda}]</b>"
-            sinais_venda_token += (f"🔴 {token_destacado} ({nome_periodo_analise}): Divergência de Baixa detectada "
-                                f"{rv}\n")
-
-
-        # Ajustar listas com base no volume de mercado
-
-        sinais_compra_geral_ += sinais_compra_token
-        sinais_venda_geral_ += sinais_venda_token
-
-        sinais_compra_25_ += sinais_compra_token if token in lista_crypto_25 else ""
-        sinais_venda_25_ += sinais_venda_token if token in lista_crypto_25 else ""
-
-        sinais_compra_50_ += sinais_compra_token if token in lista_crypto_50 else ""
-        sinais_venda_50_ += sinais_venda_token if token in lista_crypto_50 else ""
-
-        sinais_compra_100_ += sinais_compra_token if token in lista_crypto_100 else ""
-        sinais_venda_100_ += sinais_venda_token if token in lista_crypto_100 else ""
-
-
-        # Razão de Compra/Venda do Token
-        # Adicionado tratamento para evitar divisão por zero se razao_venda for 0
-        ratio_cv = (razao_compra + 1) / (razao_venda + 1)
-        df_buy_sell_ratio.loc[len(df_buy_sell_ratio)] = [token, ratio_cv]
-        df_agregado_compra_venda.loc[len(df_agregado_compra_venda)] = [token, f"COMPRA: {razao_compra}/{total_sinais_compra}, VENDA: {razao_venda}/{total_sinais_venda}"]
-
-
-        # Variação no preço 1S (calculada com base no DataFrame diário 'crypto_1d')
-        # Esta parte permanece usando 'crypto_1d' para a variação semanal específica.
-        try:
-            preco_atual_1d = crypto_1d[token]['Close'].iloc[-1]
-            preco_7d_atras_1d = crypto_1d[token]['Close'].iloc[-7]
-            variacao_1s = ((preco_atual_1d - preco_7d_atras_1d) / preco_7d_atras_1d) * 100 # Multiplicado por 100 para percentual
-            variacoes_preco_1S_str += (f"📊 {token_destacado} : Preço Atual (1D) = <code>{preco_atual_1d:.4f}</code> // "
-                                     f"Preço 7 dias atrás (1D) = <code>{preco_7d_atras_1d:.4f}</code> // "
-                                     f"Variação (7D) = {variacao_1s:.2f}%\n")
-        except IndexError:
-            variacoes_preco_1S_str += f"📊 {token_destacado} : Dados insuficientes em crypto_1d para calcular variação de 7 dias.\n"
-        except KeyError:
-            variacoes_preco_1S_str += f"📊 {token_destacado} : Token não encontrado em crypto_1d para calcular variação de 7 dias.\n"
-
-
-    return (sinais_compra_geral_, sinais_venda_geral_,
-            sinais_compra_25_, sinais_venda_25_,
-            sinais_compra_50_, sinais_venda_50_,
-            sinais_compra_100_, sinais_venda_100_,
-            df_buy_sell_ratio, df_agregado_compra_venda,
-            variacoes_preco_1S_str)
-
-
-def exibir_sinais_streamlit(
-    sinais_compra_25, sinais_venda_25,
-    sinais_compra_50, sinais_venda_50,
-    sinais_compra_100, sinais_venda_100,
-    variacoes_preco_1S_str,
-    sinais_compra_geral, sinais_venda_geral,
-    df_buy_sell_ratio, df_agregado_compra_venda,
-    token_sel: str = 'BTC', periodicidade: str = '1W'
-):
-    import re
-    import pandas as pd
-    import streamlit as st
-
-    # ========= Helpers =========
-    def strip_html(s: str) -> str:
-        return re.sub(r"<[^>]+>", "", s or "")
-
-    def parse_signals(texto: str) -> pd.DataFrame:
-        if not texto:
-            return pd.DataFrame(columns=["icon", "token", "mensagem", "periodo"])
-
-        linhas = [ln for ln in texto.splitlines() if ln.strip()]
-        periodo = ""
-        if linhas and "* SINAIS" in strip_html(linhas[0]):
-            periodo = strip_html(linhas[0]).replace("*", "").strip()
-
-        rows = []
-        for ln in linhas:
-            if "* SINAIS" in ln:
-                continue
-            ln_clean = ln.strip()
-            if len(ln_clean) < 2:
-                continue
-
-            icon = ""
-            head = ln_clean[:2]
-            if any(e in head for e in ["🟢", "🔴", "📈", "📉", "🔻", "🔺", "📊", "⚠️", "🔽"]):
-                icon = head.strip()
-            elif ln_clean[:1] in ["🟢", "🔴", "📈", "📉", "🔻", "🔺", "📊", "⚠️", "🔽"]:
-                icon = ln_clean[:1]
-
-            m_token = re.search(r"<b><u>([^<]+)</u></b>", ln_clean)
-            token = m_token.group(1) if m_token else ""
-
-            msg = strip_html(ln_clean)
-            msg = re.sub(r"\s*\[\d+/\d+\]\s*$", "", msg).strip()
-
-            rows.append({"icon": icon, "token": token, "mensagem": msg, "periodo": periodo})
-
-        df = pd.DataFrame(rows)
-        if not df.empty:
-            df = df[["icon", "token", "mensagem", "periodo"]]
-        return df
-
-    def concat_parse(*blocos: str) -> pd.DataFrame:
-        dfs = [parse_signals(b) for b in blocos if b]
-        if not dfs:
-            return pd.DataFrame(columns=["icon", "token", "mensagem", "periodo"])
-        df = pd.concat(dfs, ignore_index=True)
-        return df.sort_values(by=["token", "icon"], ignore_index=True)
-
-    # ========= UI =========
-    st.subheader(f"📈 Indicadores {periodicidade}")
-
-    tab_geral, tab_variacoes, tab_ratios, tab_resumo = st.tabs(
-        [f"Sinais {token_sel}", "Variação 7D", "Buy/Sell Ratio", "Compra × Venda"]
-    )
-
-    # ===== Geral =====
-    with tab_geral:
-        st.caption("Sinais agregados (Compra e Venda)")
-        df_geral = concat_parse(sinais_compra_geral, sinais_venda_geral)
-        filtro_token = token_sel
-
-        df_show = df_geral.copy()
-        df_show = df_show[df_show["token"].str.contains(filtro_token, case=False, na=False)]
-
-        ordem_icon = {"🟢": 0, "🔺": 0, "📈": 0, "📊": 1, "⚠️": 2, "🔽": 3, "📉": 4, "🔻": 4, "🔴": 5}
-        df_show["ord_icon"] = df_show["icon"].map(ordem_icon).fillna(9)
-        df_show = df_show.sort_values(by=["token", "ord_icon"]).drop(columns=["ord_icon"])
-
-        st.dataframe(
-            df_show.rename(columns={"icon": " ", "token": "Token", "mensagem": "Sinal", "periodo": "Tipo de Sinal"}),
-            use_container_width=True,
-            hide_index=True
-        )
-
-
-    # ===== Variações 7D =====
-    with tab_variacoes:
-        st.caption("Resumo de variação de preço em 7 dias (1D)")
-        linhas = [ln for ln in variacoes_preco_1S_str.splitlines() if ln.strip()]
-        rows = []
-        for ln in linhas:
-            token_m = re.search(r"<b><u>([^<]+)</u></b>", ln)
-            token = token_m.group(1) if token_m else ""
-            cur_m = re.search(r"Atual\s*\(1D\)\s*=\s*<code>([^<]+)</code>", ln)
-            old_m = re.search(r"7 dias atrás\s*\(1D\)\s*=\s*<code>([^<]+)</code>", ln)
-            var_m = re.search(r"Variação\s*\(7D\)\s*=\s*([-\d.,]+)%", ln)
-            atual = float(cur_m.group(1)) if cur_m else None
-            antigo = float(old_m.group(1)) if old_m else None
-            variacao = float(var_m.group(1).replace(",", ".")) if var_m else None
-            rows.append({
-                "Token": token,
-                "Preço atual (1D)": atual,
-                "Preço 7D atrás (1D)": antigo,
-                "Variação (7D) %": variacao
-            })
-        df_var = pd.DataFrame(rows)
-        if not df_var.empty:
-            df_var = df_var.sort_values(by="Variação (7D) %", ascending=False)
-
-        def highlight_token(row):
-            if row["Token"] == token_sel:
-                return [f"background-color: #ff4d4d; font-weight: bold;"] * len(row)
-            return [""] * len(row)
-
-        styled_df_var = df_var.style.apply(highlight_token, axis=1)
-
-        st.dataframe(
-            styled_df_var,
-            use_container_width=True, hide_index=True
-        )
-
-
-    # ===== Buy/Sell Ratio =====
-    with tab_ratios:
+            df = raw
+        df = df[OHLCV].dropna(subset=["Close"]).astype(float)
+        if df.empty:
+            continue
+        idx = pd.to_datetime(df.index)
+        df.index = (idx.tz_localize(None) if idx.tz is not None else idx).rename("Date")
+        if mercado == "Cripto" and s == "USD":   # USD medido em BTC: inverte e troca máxima/mínima
+            df = pd.DataFrame({"Open": 1 / df["Open"], "High": 1 / df["Low"], "Low": 1 / df["High"],
+                               "Close": 1 / df["Close"], "Volume": df["Volume"]}, index=df.index)
+        out[s] = df
+    return out
+
+
+def reamostrar(df: pd.DataFrame, regra: str) -> pd.DataFrame:
+    """OHLC correto (abertura/máx/mín/fech/volume somado). Semana começa na segunda,
+    como no TradingView; o último candle é a semana/mês em andamento."""
+    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+    kw = {"label": "left", "closed": "left"} if regra.startswith("W") else {}
+    return df.resample(regra, **kw).agg(agg).dropna(subset=["Close"])
+
+
+@st.cache_resource(ttl=TTL, max_entries=6, show_spinner="Baixando e calculando indicadores...")
+def preparar_dados(simbolos: tuple[str, ...], periodo: str, data_maxima: str | None,
+                   mercado: str = "Cripto") -> dict:
+    """{'1D'|'1W'|'1M': {ativo: DataFrame}}. Somente leitura (é compartilhado)."""
+    brutos = baixar_ohlc(simbolos, periodo, mercado)
+    corte = pd.Timestamp(data_maxima) if data_maxima else None
+
+    def um_token(df):
+        if corte is not None:
+            df = df.loc[:corte]
+        if len(df) < 60:
+            return None
+        return (adicionar_indicadores(df), adicionar_indicadores(reamostrar(df, "W-MON")),
+                adicionar_indicadores(reamostrar(df, "MS")))
+
+    # tokens em paralelo (as rotinas numéricas do pandas/numpy liberam o GIL)
+    with ThreadPoolExecutor(max_workers=min(8, (os.cpu_count() or 2))) as ex:
+        resultados = dict(zip(brutos, ex.map(um_token, brutos.values())))
+    dados = {"1D": {}, "1W": {}, "1M": {}}
+    for s, r in resultados.items():
+        if r is not None:
+            dados["1D"][s], dados["1W"][s], dados["1M"][s] = r
+    return dados
+
+
+def faixas_volume(d1: dict) -> tuple[list, list, list]:
+    """Faixas de liquidez pela média de volume diário dos últimos 7 dias."""
+    vol = pd.Series({s: df["Volume"].iloc[-7:].mean() for s, df in d1.items()}, dtype=float)
+    return (vol.index[vol > 4e8].tolist(),
+            vol.index[(vol > 6e7) & (vol <= 4e8)].tolist(),
+            vol.index[vol <= 6e7].tolist())
+
+
+# =========================================================================== #
+# Sinais (tabela de regras, avaliadas para todos os tokens de uma vez)
+# =========================================================================== #
+
+f = ln.fmt
+
+
+@dataclass(frozen=True)
+class Regra:
+    lado: str                                   # "Compra" | "Venda"
+    icone: str
+    cond: Callable[[pd.DataFrame], pd.Series]   # S (1 linha por token) -> bool
+    msg: Callable[[pd.Series, str], str]        # (linha do token, período) -> texto
+
+
+def _obv_msg(r, P, compra):
+    if compra:
+        return (f"({P}) OBV acima da média de 20 e preço subindo → alta confiável" if r.Price_Change > 0
+                else f"({P}) OBV acima da média de 20 e preço caindo → possível suporte/recuperação")
+    return (f"({P}) OBV abaixo da média de 20 e preço subindo → divergência, alerta de reversão" if r.Price_Change > 0
+            else f"({P}) OBV abaixo da média de 20 e preço caindo → baixa confirmada")
+
+
+REGRAS: list[Regra] = [
+    # ------------------------------ COMPRA ------------------------------ #
+    Regra("Compra", "🟢", lambda S: S.EMA200 < S.EMA50,
+          lambda r, P: f"({P}) EMA200 ({f(r.EMA200)}) menor que EMA50 ({f(r.EMA50)}) → Bull"),
+    Regra("Compra", "🔽", lambda S: (S.EMA200 < S.EMA50) & (S.Close < S.EMA50) & (S.Close < S.EMA111)
+          & (S.Close <= S.EMA200) & (S.Close >= S.EMA350),
+          lambda r, P: f"({P}) Preço abaixo das EMAs 50, 111 e 200, mas acima do suporte da EMA350 ({f(r.EMA350)})"),
+    Regra("Compra", "📉", lambda S: S.RSI_1D <= 30, lambda r, P: f"RSI 1D em sobrevenda ({r.RSI_1D:.2f})"),
+    Regra("Compra", "📉", lambda S: S.RSI_1W <= 30, lambda r, P: f"RSI 1S em sobrevenda ({r.RSI_1W:.2f})"),
+    Regra("Compra", "📉", lambda S: S.RSI_1M <= 30, lambda r, P: f"RSI 1M em sobrevenda ({r.RSI_1M:.2f})"),
+    Regra("Compra", "📈", lambda S: S.MACD_Hist > 0, lambda r, P: f"({P}) MACD acima da linha de sinal → Bull"),
+    Regra("Compra", "📊", lambda S: S.OBV > S.OBV_SMA20, lambda r, P: _obv_msg(r, P, True)),
+    Regra("Compra", "📉", lambda S: S.Close < S.Lower_BB,
+          lambda r, P: f"({P}) Preço abaixo da Bollinger inferior ({f(r.Lower_BB)}) → "
+                       + ("contraindo → movimento forte se aproximando" if r.BB_Contraction_Status == "Contraindo"
+                          else "expandindo → alta volatilidade")),
+    Regra("Compra", "🔺", lambda S: (S["Fib_38.2%"] >= S.Close) & (S.Close >= S["Fib_61.8%"]),
+          lambda r, P: f"({P}) Preço entre Fibo 38,2% ({f(r['Fib_38.2%'])}, compra arrojada) e "
+                       f"61,8% ({f(r['Fib_61.8%'])}, golden pocket)"),
+    Regra("Compra", "🟢", lambda S: S["Williams_%R"] <= -80,
+          lambda r, P: f"({P}) Williams %R ({r['Williams_%R']:.2f}) ≤ -80 (sobrevenda)"),
+    Regra("Compra", "🟢", lambda S: S.StochRSI <= 0.2,
+          lambda r, P: f"({P}) StochRSI ({r.StochRSI:.2f}) ≤ 0,2 (sobrevenda)"),
+    Regra("Compra", "🟢", lambda S: S.VolumeSpike.astype(bool) & (S.Close > S.Close_ant),
+          lambda r, P: f"({P}) Pico de volume com preço subindo (acumulação)"),
+    Regra("Compra", "🟢", lambda S: (S.ADX > 25) & (S["DI+"] > S["DI-"]),
+          lambda r, P: f"({P}) ADX ({r.ADX:.2f}) > 25 e DI+ > DI- (tendência de alta)"),
+    Regra("Compra", "🟢", lambda S: S.BullishDivergence.astype(bool),
+          lambda r, P: f"({P}) Divergência de alta RSI x preço"),
+    Regra("Compra", "🟢", lambda S: (S["DI+"] > S["DI-"]) & (S["DI+_ant"] < S["DI-_ant"]),
+          lambda r, P: f"({P}) DI+ cruzou acima do DI- (mudança de tendência)"),
+    Regra("Compra", "🟢", lambda S: (S["Williams_%R"] > -80) & (S["Williams_%R_ant"] <= -80),
+          lambda r, P: f"({P}) Williams %R cruzando acima de -80 (saindo da sobrevenda)"),
+    Regra("Compra", "🟢", lambda S: (S.StochRSI > 0.2) & (S.StochRSI_ant <= 0.2),
+          lambda r, P: f"({P}) StochRSI cruzando acima de 0,2 (momentum positivo)"),
+    # ------------------------------ VENDA ------------------------------- #
+    Regra("Venda", "🔴", lambda S: S.EMA200 > S.EMA50,
+          lambda r, P: f"({P}) EMA200 ({f(r.EMA200)}) > EMA50 ({f(r.EMA50)}) → Bear"),
+    Regra("Venda", "🔴", lambda S: (S.Close > S.EMA50) & (S.Close > S.EMA111) & (S.Close > S.EMA200)
+          & (S.Close > S.EMA350),
+          lambda r, P: f"({P}) Preço acima das EMAs 50, 111, 200 e 350"),
+    Regra("Venda", "🔴", lambda S: S.Close > S.EMA350x2,
+          lambda r, P: f"({P}) Preço acima da EMA350×2 ({f(r.EMA350x2)}) → atenção ao cruzamento com EMA111 ({f(r.EMA111)})"),
+    Regra("Venda", "⚠️", lambda S: S.EMA111 / S.EMA350x2 >= 0.9,
+          lambda r, P: f"({P}) Pi Cycle Top em zona de alerta (EMA111 {f(r.EMA111)} x EMA350×2 {f(r.EMA350x2)})"),
+    Regra("Venda", "📈", lambda S: S.RSI_1D >= 70, lambda r, P: f"RSI 1D em sobrecompra ({r.RSI_1D:.2f})"),
+    Regra("Venda", "📈", lambda S: S.RSI_1W >= 70, lambda r, P: f"RSI 1S em sobrecompra ({r.RSI_1W:.2f})"),
+    Regra("Venda", "📈", lambda S: S.RSI_1M >= 70, lambda r, P: f"RSI 1M em sobrecompra ({r.RSI_1M:.2f})"),
+    Regra("Venda", "📉", lambda S: S.MACD_Hist < 0, lambda r, P: f"({P}) MACD abaixo da linha de sinal → Bear"),
+    Regra("Venda", "🔻", lambda S: S.OBV < S.OBV_SMA20, lambda r, P: _obv_msg(r, P, False)),
+    Regra("Venda", "📈", lambda S: S.Close > S.Upper_BB,
+          lambda r, P: f"({P}) Preço acima da Bollinger superior ({f(r.Upper_BB)}) → "
+                       + ("contraindo → movimento forte se aproximando" if r.BB_Contraction_Status == "Contraindo"
+                          else "expandindo → alta volatilidade")),
+    Regra("Venda", "📉", lambda S: S["Fib_78.6%"] > S.Close,
+          lambda r, P: f"({P}) Preço abaixo da retração de Fibo 78,6% ({f(r['Fib_78.6%'])})"),
+    Regra("Venda", "📉", lambda S: (S["Ext_161.8%"] >= S.Close) & (S.Close >= S["Ext_100%"]),
+          lambda r, P: f"({P}) Preço entre as extensões de Fibo 100% ({f(r['Ext_100%'])}) e 161,8% ({f(r['Ext_161.8%'])})"),
+    Regra("Venda", "🔴", lambda S: S["Williams_%R"] >= -20,
+          lambda r, P: f"({P}) Williams %R ({r['Williams_%R']:.2f}) ≥ -20 (sobrecompra)"),
+    Regra("Venda", "🔴", lambda S: S.StochRSI >= 0.8,
+          lambda r, P: f"({P}) StochRSI ({r.StochRSI:.2f}) ≥ 0,8 (sobrecompra)"),
+    Regra("Venda", "🔴", lambda S: S.VolumeSpike.astype(bool) & (S.Close < S.Close_ant),
+          lambda r, P: f"({P}) Pico de volume com preço caindo (distribuição)"),
+    Regra("Venda", "🔴", lambda S: (S.ADX > 25) & (S["DI-"] > S["DI+"]),
+          lambda r, P: f"({P}) ADX ({r.ADX:.2f}) > 25 e DI- > DI+ (tendência de baixa)"),
+    Regra("Venda", "🔴", lambda S: (S["DI-"] > S["DI+"]) & (S["DI-_ant"] < S["DI+_ant"]),
+          lambda r, P: f"({P}) DI- cruzou acima do DI+ (mudança de tendência)"),
+    Regra("Venda", "🔴", lambda S: (S["Williams_%R"] < -20) & (S["Williams_%R_ant"] >= -20),
+          lambda r, P: f"({P}) Williams %R cruzando abaixo de -20 (saindo da sobrecompra)"),
+    Regra("Venda", "🔴", lambda S: (S.StochRSI < 0.8) & (S.StochRSI_ant >= 0.8),
+          lambda r, P: f"({P}) StochRSI cruzando abaixo de 0,8 (momentum negativo)"),
+    Regra("Venda", "🔴", lambda S: S.BearishDivergence.astype(bool),
+          lambda r, P: f"({P}) Divergência de baixa RSI x preço"),
+]
+TOTAL = {lado: sum(r.lado == lado for r in REGRAS) for lado in ("Compra", "Venda")}
+
+
+def _snapshot(dados: dict, freq: str) -> pd.DataFrame:
+    """Uma linha por token com o último candle, o anterior (sufixo _ant) e RSI 1D/1W/1M."""
+    linhas = {}
+    for s, df in dados[freq].items():
+        if len(df) < 3:
+            continue
+        r = df.iloc[-1].to_dict()
+        ant = df.iloc[-2]
+        for k in ("Close", "DI+", "DI-", "Williams_%R", "StochRSI"):
+            r[f"{k}_ant"] = ant[k]
+        for fr in ("1D", "1W", "1M"):
+            r[f"RSI_{fr}"] = dados[fr][s]["RSI"].iloc[-1] if s in dados[fr] else np.nan
+        linhas[s] = r
+    return pd.DataFrame.from_dict(linhas, orient="index").infer_objects()
+
+
+@st.cache_data(ttl=TTL, show_spinner=False)
+def analisar_sinais(chave: tuple, freq: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Retorna (sinais, resumo). ``chave`` = (simbolos, periodo, data_maxima)."""
+    dados = preparar_dados(*chave)
+    S = _snapshot(dados, freq)
+    P = freq.lower()
+    registros = []
+    cont = {lado: pd.Series(0, index=S.index) for lado in TOTAL}
+    for regra in REGRAS:
+        mask = regra.cond(S).fillna(False).astype(bool)
+        cont[regra.lado] += mask.astype(int)
+        for tok, r in S[mask].iterrows():                       # só os tokens que dispararam
+            registros.append((tok, regra.lado, regra.icone, regra.msg(r, P), freq))
+    sinais = pd.DataFrame(registros, columns=["Token", "Lado", " ", "Sinal", "Período"])
+
+    # Variação de 7 dias sempre pelo diário (iloc[-8] = 7 candles atrás)
+    d1 = dados["1D"]
+    atual = pd.Series({s: d1[s]["Close"].iloc[-1] for s in S.index if s in d1})
+    antes = pd.Series({s: d1[s]["Close"].asof(d1[s].index[-1] - pd.Timedelta(days=7))
+                       for s in S.index if s in d1 and len(d1[s]) >= 8})
+    resumo = pd.DataFrame({
+        "Token": S.index,
+        "Compra": [f"{c}/{TOTAL['Compra']}" for c in cont["Compra"]],
+        "Venda": [f"{v}/{TOTAL['Venda']}" for v in cont["Venda"]],
+        "Buy/Sell Ratio": ((cont["Compra"] + 1) / (cont["Venda"] + 1)).round(3).to_numpy(),
+        "Preço atual (1D)": atual.reindex(S.index).to_numpy(),
+        "Preço 7D atrás (1D)": antes.reindex(S.index).to_numpy(),
+    })
+    resumo["Variação (7D) %"] = (100 * (resumo["Preço atual (1D)"] / resumo["Preço 7D atrás (1D)"] - 1)).round(2)
+    return sinais, resumo
+
+
+def texto_telegram(sinais: pd.DataFrame, tokens: list | None = None) -> str:
+    """Mesmo formato HTML de antes, caso você ainda envie para o Telegram."""
+    s = sinais if tokens is None else sinais[sinais["Token"].isin(tokens)]
+    partes = []
+    for lado in ("Compra", "Venda"):
+        bloco = s[s["Lado"] == lado]
+        if bloco.empty:
+            continue
+        per = bloco["Período"].iloc[0]
+        partes.append(f"<b>* SINAIS DE {lado.upper()} ({per}): *</b>\n")
+        partes += [f"{r[' ']} <b><u>{r.Token}</u></b> {r.Sinal}" for _, r in bloco.iterrows()]
+        partes.append("")
+    return "\n".join(partes)
+
+
+# UI: sinais
+
+def _destacar(token_sel: str):
+    def _f(row):
+        return ["background-color: #ff4d4d55; font-weight: bold;" if row["Token"] == token_sel else ""] * len(row)
+    return _f
+
+
+def exibir_sinais(sinais: pd.DataFrame, resumo: pd.DataFrame, token_sel: str, freq: str):
+    st.subheader(f"📈 Indicadores {freq}")
+    t1, t2, t3, t4 = st.tabs([f"Sinais {token_sel}", "Variação 7D", "Buy/Sell Ratio", "Compra × Venda"])
+    with t1:
+        st.caption("Sinais agregados (compra e venda)")
+        s = sinais[sinais["Token"] == token_sel].sort_values(["Lado", " "])
+        st.dataframe(s, hide_index=True)
+    with t2:
+        st.caption("Variação de preço em 7 dias (diário)")
+        v = resumo[["Token", "Preço atual (1D)", "Preço 7D atrás (1D)", "Variação (7D) %"]]
+        st.dataframe(v.sort_values("Variação (7D) %", ascending=False).style.apply(_destacar(token_sel), axis=1),
+                     hide_index=True)
+    with t3:
         st.caption("Buy/Sell Ratio (quanto maior, mais 'atrativo' o conjunto de sinais do token)")
-        if not df_buy_sell_ratio.empty:
-            df_r = df_buy_sell_ratio.copy()
-            df_r = df_r.sort_values(by="Buy/Sell Ratio", ascending=False)
-            df_r["Buy/Sell Ratio"] = df_r["Buy/Sell Ratio"].astype(float).round(3)
+        r = resumo[["Token", "Buy/Sell Ratio"]].sort_values("Buy/Sell Ratio", ascending=False)
+        st.dataframe(r.style.apply(_destacar(token_sel), axis=1), hide_index=True)
+    with t4:
+        st.caption("Contadores agregados por token")
+        st.dataframe(resumo[["Token", "Compra", "Venda"]].style.apply(_destacar(token_sel), axis=1),
+                     hide_index=True)
 
-            df_r.rename(columns={"Token": "Token", "Buy/Sell Ratio": "Buy/Sell Ratio"})
-            styled_df_r = df_r.style.apply(highlight_token, axis=1)
 
-            st.dataframe(
-                styled_df_r,
-                use_container_width=True, hide_index=True
-            )
+# =========================================================================== #
+# UI: gráficos
+# =========================================================================== #
 
-        else:
-            st.info("Sem dados de Buy/Sell Ratio.")
-
-    # ===== Compra × Venda =====
-    with tab_resumo:
-        st.caption("Contadores agregados (COMPRA/VENDA) por token")
-        if not df_agregado_compra_venda.empty:
-            def split_counts(s: str):
-                compra_m = re.search(r"COMPRA:\s*(\d+/\d+)", s or "")
-                venda_m  = re.search(r"VENDA:\s*(\d+/\d+)", s or "")
-                return (compra_m.group(1) if compra_m else "", venda_m.group(1) if venda_m else "")
-
-            df_cv = df_agregado_compra_venda.copy()
-            compra_venda = df_cv["Compra x Venda"].apply(split_counts)
-            df_cv["Compra"] = compra_venda.apply(lambda x: x[0])
-            df_cv["Venda"]  = compra_venda.apply(lambda x: x[1])
-            df_cv = df_cv.drop(columns=["Compra x Venda"]).rename(columns={"Token": "Token"})
-
-            styled_df_cv = df_cv.style.apply(highlight_token, axis=1)
-
-            st.dataframe(styled_df_cv, use_container_width=True, hide_index=True)
-        else:
-            st.info("Sem dados de Compra × Venda.")
-
-##############################
-
-def plot_weekly_with_indicators(
-    s_close=None,
-    s_date=None,
-    df=None,
-    token_sel = 'BTC',
-    compute_missing=False,
-    rsi_period=14
-):
-
-    # -------- preparar dados de entrada --------
-    if df is None:
-        if s_close is None or s_date is None:
-            raise ValueError("Forneça df OU (s_close e s_date).")
-        df = pd.DataFrame({'Date': pd.to_datetime(s_date), 'Close': pd.to_numeric(s_close)})
-    else:
-        df = df.copy()
-        # normalizar nomes mais comuns (case-insensitive)
-        cols_lower = {c.lower(): c for c in df.columns}
-        # garantir colunas padrão se existirem com variações
-        if 'date' in cols_lower and 'Date' not in df.columns:
-            df.rename(columns={cols_lower['date']: 'Date'}, inplace=True)
-        if 'close' in cols_lower and 'Close' not in df.columns:
-            df.rename(columns={cols_lower['close']: 'Close'}, inplace=True)
-
-    # ordenar por data e garantir datetime
-    if 'Date' in df.columns:
-        df['Date'] = pd.to_datetime(df['Date'])
-        df.sort_values('Date', inplace=True)
-    else:
-        # se não tiver Date, tenta índice datetime
-        if not isinstance(df.index, pd.DatetimeIndex):
-            raise ValueError("O DataFrame precisa ter coluna 'Date' ou índice DateTime.")
-        df = df.sort_index()
-        df['Date'] = df.index
-
-    # -------- calcular indicadores ausentes (opcional) --------
-    if compute_missing:
-        if 'EMA50' not in df.columns and 'Close' in df.columns:
-            df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
-        if 'EMA200' not in df.columns and 'Close' in df.columns:
-            df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
-        if 'RSI' not in df.columns and 'Close' in df.columns:
-            # RSI (Wilder)
-            delta = df['Close'].diff()
-            gain = delta.clip(lower=0)
-            loss = -delta.clip(upper=0)
-            avg_gain = gain.ewm(alpha=1/rsi_period, min_periods=rsi_period, adjust=False).mean()
-            avg_loss = loss.ewm(alpha=1/rsi_period, min_periods=rsi_period, adjust=False).mean()
-            rs = avg_gain / (avg_loss.replace(0, np.nan))
-            df['RSI'] = 100 - (100 / (1 + rs))
-
-    # -------- criar figura com eixo secundário --------
+def grafico_indicadores(df: pd.DataFrame, token: str, freq: str, moeda: str = "USD"):
     fig = make_subplots(specs=[[{"secondary_y": True}]])
-
-    # Close (primário)
-    if 'Close' in df.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=df['Date'],
-                y=df['Close'],
-                mode='lines',
-                name='BTC Close',
-                line=dict(width=2)
-            ),
-            secondary_y=False
-        )
-
-    # EMAs (primário, se existirem)
-    if 'EMA50' in df.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=df['Date'],
-                y=df['EMA50'],
-                mode='lines',
-                name='EMA50',
-                line=dict(width=1.5, dash='dot')
-            ),
-            secondary_y=False
-        )
-
-    if 'EMA200' in df.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=df['Date'],
-                y=df['EMA200'],
-                mode='lines',
-                name='EMA200',
-                line=dict(width=1.5, dash='dash')
-            ),
-            secondary_y=False
-        )
-
-    # RSI (secundário)
-    if 'RSI' in df.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=df['Date'],
-                y=df['RSI'],
-                mode='lines',
-                name='RSI',
-                line=dict(width=2)
-            ),
-            secondary_y=True
-        )
-        # linhas guia 30/50/70 no eixo RSI
-        for lvl, dash in [(30, 'dot'), (50, 'dash'), (70, 'dot')]:
-            fig.add_hline(
-                y=lvl,
-                line=dict(width=1, dash=dash),
-                secondary_y=True
-            )
-
-    # -------- Fibs/Extensões (podem ser séries ou valores constantes) --------
-    fib_cols = ['Fib_38.2%', 'Fib_50%', 'Fib_61.8%', 'Ext_61.8%', 'Ext_100%', 'Ext_161.8%']
-    for col in fib_cols:
-        if col in df.columns:
-            s = df[col]
-            # se for constante (ou quase), usa hline; senão, plota como linha
-            if pd.api.types.is_numeric_dtype(s):
-                if s.nunique(dropna=True) <= 1:
-                    level = float(s.dropna().iloc[-1]) if s.dropna().shape[0] else None
-                    if level is not None:
-                        fig.add_hline(
-                            y=level,
-                            line=dict(width=1),
-                            annotation_text=col,
-                            annotation_position='top left',
-                            secondary_y=False
-                        )
-                else:
-                    fig.add_trace(
-                        go.Scatter(
-                            x=df['Date'],
-                            y=s,
-                            mode='lines',
-                            name=col,
-                            line=dict(width=1)
-                        ),
-                        secondary_y=False
-                    )
-
-    # -------- layout --------
-    fig.update_layout(
-        title=f'{token_sel} Semanal: Close, EMAs, RSI e Fibs/Extensões',
-        template='plotly_dark',
-        hovermode='x unified',
-        margin=dict(l=60, r=60, t=60, b=40),
-        legend=dict(x=0.01, y=0.99)
-    )
-
-    fig.update_xaxes(title_text='Data')
-    fig.update_yaxes(
-        title_text='Preço (USD)',
-        secondary_y=False
-    )
-    fig.update_yaxes(
-        title_text='RSI',
-        range=[0, 100],
-        secondary_y=True
-    )
-
-    st.plotly_chart(fig)
+    fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name=f"{token} Close", line=dict(width=2)),
+                  secondary_y=False)
+    fig.add_trace(go.Scatter(x=df.index, y=df["EMA50"], name="EMA50", line=dict(width=1.5, dash="dot")),
+                  secondary_y=False)
+    fig.add_trace(go.Scatter(x=df.index, y=df["EMA200"], name="EMA200", line=dict(width=1.5, dash="dash")),
+                  secondary_y=False)
+    fig.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI", line=dict(width=1.5)), secondary_y=True)
+    for lvl, dash in ((30, "dot"), (50, "dash"), (70, "dot")):
+        fig.add_hline(y=lvl, line=dict(width=1, dash=dash), secondary_y=True)
+    fig.update_layout(title=f"{token} {freq}: Close, EMAs e RSI", template="plotly_dark",
+                      hovermode="x unified", margin=dict(l=60, r=60, t=60, b=40), legend=dict(x=0.01, y=0.99))
+    fig.update_yaxes(title_text=f"Preço ({moeda})", secondary_y=False)
+    fig.update_yaxes(title_text="RSI", range=[0, 100], secondary_y=True)
+    st.plotly_chart(fig, theme=None)
 
 
-def plot_with_semicircles(
-    s_close, s_date,
-    token_sel = 'BTC',
-    x0=datetime(2025, 3, 2), #~CamelFinance's
-    num_ondas=8,
-    periodo_sem=4 * 7,
-    y_pico=10
-):
-
-    # --- gerar ondas ---
-    x_vals = []
-    y_vals = []
-
-    # ondas pra trás
-    for i in range(num_ondas // 2, 0, -1):
-        x_start = x0 - timedelta(weeks=i * periodo_sem)
-        x_end = x_start + timedelta(weeks=periodo_sem)
-        x_wave = pd.date_range(start=x_start, end=x_end, periods=100)
-        t = np.linspace(0, np.pi, 100)
-        y_wave = y_pico * np.sin(t)
-        x_vals.extend(x_wave)
-        y_vals.extend(y_wave)
-
-    # ondas pra frente
-    for i in range(num_ondas // 2):
-        x_start = x0 + timedelta(weeks=i * periodo_sem)
-        x_end = x_start + timedelta(weeks=periodo_sem)
-        x_wave = pd.date_range(start=x_start, end=x_end, periods=100)
-        t = np.linspace(0, np.pi, 100)
-        y_wave = y_pico * np.sin(t)
-        x_vals.extend(x_wave)
-        y_vals.extend(y_wave)
-
-    # --- plotar tudo ---
+def grafico_semiciclos(df: pd.DataFrame, token: str, x0=pd.Timestamp(2025, 3, 2),
+                       num_ondas: int = 8, periodo_sem: int = 4 * 7, y_pico: float = 10, moeda: str = "USD"):
+    """Ondas senoidais simétricas em torno de x0 (vetorizado)."""
+    k = np.arange(-(num_ondas // 2), num_ondas // 2)                 # índices das ondas
+    t = np.linspace(0, np.pi, 100)
+    inicio = x0 + pd.to_timedelta(k * periodo_sem, unit="W")
+    xs = (inicio.values[:, None] + (t / np.pi * periodo_sem * 7 * 86400e9).astype("timedelta64[ns]")).ravel()
+    ys = np.tile(y_pico * np.sin(t), len(k))
     fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Close", line=dict(color="gold", width=2)))
+    fig.add_trace(go.Scatter(x=xs, y=ys, name="Semiciclos", yaxis="y2",
+                             line=dict(color="cyan", width=3, dash="dot")))
+    fig.update_layout(title=f"{token} Close + Ondas Simétricas", template="plotly_dark", hovermode="x unified",
+                      yaxis=dict(title=f"Preço ({moeda})", tickfont=dict(color="gold")),
+                      yaxis2=dict(title="Amplitude das Ondas", tickfont=dict(color="cyan"),
+                                  overlaying="y", side="right"),
+                      legend=dict(x=0.02, y=0.98), margin=dict(l=60, r=60, t=60, b=40))
+    st.plotly_chart(fig, theme=None)
 
-    # BTC Close (eixo Y da esquerda)
-    fig.add_trace(go.Scatter(
-        x=s_date.values,
-        y=s_close.values,
-        mode='lines',
-        name='Close',
-        line=dict(color='gold', width=2),
-        yaxis='y1'
-    ))
 
-    # Ondas semicirculares (eixo Y da direita)
-    fig.add_trace(go.Scatter(
-        x=x_vals,
-        y=y_vals,
-        mode='lines',
-        name='Semiciclos',
-        line=dict(color='cyan', width=3, dash='dot'),
-        yaxis='y2'
-    ))
+# =========================================================================== #
+# Rebalanceador
+# =========================================================================== #
 
-    # --- layout ---
-    fig.update_layout(
-        title=f'{token_sel} Close + Ondas Simétricas',
-        template='plotly_dark',
-        hovermode='x unified',
-        xaxis=dict(title='Data'),
-        yaxis=dict(
-            title='Preço (USD)',
-            #titlefont=dict(color='gold'),
-            tickfont=dict(color='gold')
-        ),
-        yaxis2=dict(
-            title='Amplitude das Ondas',
-            #titlefont=dict(color='cyan'),
-            tickfont=dict(color='cyan'),
-            overlaying='y',
-            side='right'
-        ),
-        legend=dict(x=0.02, y=0.98),
-        margin=dict(l=60, r=60, t=60, b=40)
-    )
+CAIXAS = ("USD", "BRL")
 
-    #fig.show()
-    st.plotly_chart(fig, theme=None, use_container_width=True)
 
-def plot_weekly_with_indicators(
-    token_sel = 'BTC',
-    s_close=None,
-    s_date=None,
-    df=None,
-    compute_missing=False,
-    rsi_period=14
-):
-
-    # -------- preparar dados de entrada --------
-    if df is None:
-        if s_close is None or s_date is None:
-            raise ValueError("Forneça df OU (s_close e s_date).")
-        df = pd.DataFrame({'Date': pd.to_datetime(s_date), 'Close': pd.to_numeric(s_close)})
-    else:
-        df = df.copy()
-        # normalizar nomes mais comuns (case-insensitive)
-        cols_lower = {c.lower(): c for c in df.columns}
-        # garantir colunas padrão se existirem com variações
-        if 'date' in cols_lower and 'Date' not in df.columns:
-            df.rename(columns={cols_lower['date']: 'Date'}, inplace=True)
-        if 'close' in cols_lower and 'Close' not in df.columns:
-            df.rename(columns={cols_lower['close']: 'Close'}, inplace=True)
-
-    # ordenar por data e garantir datetime
-    if 'Date' in df.columns:
-        df['Date'] = pd.to_datetime(df['Date'])
-        df.sort_values('Date', inplace=True)
-    else:
-        # se não tiver Date, tenta índice datetime
-        if not isinstance(df.index, pd.DatetimeIndex):
-            raise ValueError("O DataFrame precisa ter coluna 'Date' ou índice DateTime.")
-        df = df.sort_index()
-        df['Date'] = df.index
-
-    # -------- calcular indicadores ausentes (opcional) --------
-    if compute_missing:
-        if 'EMA50' not in df.columns and 'Close' in df.columns:
-            df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
-        if 'EMA200' not in df.columns and 'Close' in df.columns:
-            df['EMA200'] = df['Close'].ewm(span=200, adjust=False).mean()
-        if 'RSI' not in df.columns and 'Close' in df.columns:
-            # RSI (Wilder)
-            delta = df['Close'].diff()
-            gain = delta.clip(lower=0)
-            loss = -delta.clip(upper=0)
-            avg_gain = gain.ewm(alpha=1/rsi_period, min_periods=rsi_period, adjust=False).mean()
-            avg_loss = loss.ewm(alpha=1/rsi_period, min_periods=rsi_period, adjust=False).mean()
-            rs = avg_gain / (avg_loss.replace(0, np.nan))
-            df['RSI'] = 100 - (100 / (1 + rs))
-
-    # -------- criar figura com eixo secundário --------
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-
-    # Close (primário)
-    if 'Close' in df.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=df['Date'],
-                y=df['Close'],
-                mode='lines',
-                name='BTC Close',
-                line=dict(width=2)
-            ),
-            secondary_y=False
-        )
-
-    # EMAs (primário, se existirem)
-    if 'EMA50' in df.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=df['Date'],
-                y=df['EMA50'],
-                mode='lines',
-                name='EMA50',
-                line=dict(width=1.5, dash='dot')
-            ),
-            secondary_y=False
-        )
-
-    if 'EMA200' in df.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=df['Date'],
-                y=df['EMA200'],
-                mode='lines',
-                name='EMA200',
-                line=dict(width=1.5, dash='dash')
-            ),
-            secondary_y=False
-        )
-
-    # RSI (secundário)
-    if 'RSI' in df.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=df['Date'],
-                y=df['RSI'],
-                mode='lines',
-                name='RSI',
-                line=dict(width=2)
-            ),
-            secondary_y=True
-        )
-        # linhas guia 30/50/70 no eixo RSI
-        for lvl, dash in [(30, 'dot'), (50, 'dash'), (70, 'dot')]:
-            fig.add_hline(
-                y=lvl,
-                line=dict(width=1, dash=dash),
-                secondary_y=True
-            )
-
-    # -------- Fibs/Extensões (podem ser séries ou valores constantes) --------
-    fib_cols = ['Fib_38.2%', 'Fib_50%', 'Fib_61.8%', 'Ext_61.8%', 'Ext_100%', 'Ext_161.8%']
-    for col in fib_cols:
-        if col in df.columns:
-            s = df[col]
-            # se for constante (ou quase), usa hline; senão, plota como linha
-            if pd.api.types.is_numeric_dtype(s):
-                if s.nunique(dropna=True) <= 1:
-                    level = float(s.dropna().iloc[-1]) if s.dropna().shape[0] else None
-                    if level is not None:
-                        fig.add_hline(
-                            y=level,
-                            line=dict(width=1),
-                            annotation_text=col,
-                            annotation_position='top left',
-                            secondary_y=False
-                        )
-                else:
-                    fig.add_trace(
-                        go.Scatter(
-                            x=df['Date'],
-                            y=s,
-                            mode='lines',
-                            name=col,
-                            line=dict(width=1)
-                        ),
-                        secondary_y=False
-                    )
-
-    # -------- layout --------
-    fig.update_layout(
-        title=f'{token_sel} Semanal: Close, EMAs, RSI e Fibs/Extensões',
-        template='plotly_dark',
-        hovermode='x unified',
-        margin=dict(l=60, r=60, t=60, b=40),
-        legend=dict(x=0.01, y=0.99)
-    )
-
-    fig.update_xaxes(title_text='Data')
-    fig.update_yaxes(
-        title_text='Preço (USD)',
-        secondary_y=False
-    )
-    fig.update_yaxes(
-        title_text='RSI',
-        range=[0, 100],
-        secondary_y=True
-    )
-
-    #fig.show()
-    st.plotly_chart(fig, theme=None, use_container_width=True)
-
-def _parse_txt_fast(text: str):
+def _parse_txt(text: str):
     if not text:
         return {}, pd.DataFrame(columns=["Ativo", "Qt", "Data"])
+    txt = "\n".join(l_ for l_ in text.splitlines() if l_.strip() and not l_.strip().startswith("#"))
+    alvo_txt, _, trade_txt = txt.partition("@")
 
-    # Remove comentários e vazios
-    txtraw = "\n".join(
-        ln for ln in text.splitlines()
-        if ln.strip() and not ln.strip().startswith("#")
-    )
+    pares = re.findall(r"(?mi)^\s*([A-Za-z0-9_.\-]+)\s+([0-9]*\.?[0-9]+)\s*$", alvo_txt)
+    alvos = pd.DataFrame(pares, columns=["Ativo", "Pct"])
+    alvos["Pct"] = pd.to_numeric(alvos["Pct"], errors="coerce")
+    alvos["Ativo"] = alvos["Ativo"].str.upper().str.replace(r"\.SA$", "", regex=True)
+    alvos = alvos.dropna(subset=["Pct"]).groupby("Ativo", as_index=False)["Pct"].sum()
+    targets = dict(zip(alvos["Ativo"], alvos["Pct"]))
+    soma = float(alvos["Pct"].sum())
 
-    # Separa ativos das %
-    parts = txtraw.split("@", 1)
-    alvo_txt = parts[0].strip()
-    trade_txt = parts[1].strip() if len(parts) > 1 else ""
+    if trade_txt.strip():
+        trades = pd.read_csv(StringIO(trade_txt.strip()), sep=r"[,\s]+", engine="python", header=None,
+                             names=["Ativo", "Qt", "Data"], usecols=[0, 1, 2])
+        trades["Ativo"] = trades["Ativo"].str.upper().str.replace(r"\.SA$", "", regex=True)
+        trades["Qt"] = pd.to_numeric(trades["Qt"], errors="coerce")
+        trades["Data"] = pd.to_datetime(trades["Data"], dayfirst=True, errors="coerce")
+        trades = trades.dropna(subset=["Ativo", "Qt"])
+    else:
+        trades = pd.DataFrame(columns=["Ativo", "Qt", "Data"])
 
-    # --- Alvos (regex multiline, sem loop) ---
-    alvo_pairs = re.findall(r"(?mi)^\s*([A-Za-z0-9_\-]+)\s+([0-9]*\.?[0-9]+)\s*$", alvo_txt)
-    df_targets = pd.DataFrame(alvo_pairs, columns=["Ativo", "Pct"])
-    df_targets["Pct"] = pd.to_numeric(df_targets["Pct"], errors="coerce")
-    df_targets["Ativo"] = df_targets["Ativo"].str.upper()
-    df_targets = df_targets.dropna(subset=["Pct"]).groupby("Ativo", as_index=False)["Pct"].sum()
-
-    targets = dict(zip(df_targets["Ativo"], df_targets["Pct"]))
-    soma = float(df_targets["Pct"].sum())
     if soma < 1 - 1e-9:
-        targets["USD"] = round(1 - soma, 12)
+        # o que sobra vira caixa: em BRL se você só tem caixa em reais; senão em USD
+        tem = set(trades["Ativo"])
+        caixa = "BRL" if ("BRL" in tem or "BRL" in targets) and "USD" not in tem else "USD"
+        targets[caixa] = round(targets.get(caixa, 0) + 1 - soma, 12)
     elif soma > 1 + 1e-9:
         st.warning(f"Soma dos alvos = {soma:.4f} (>1). Ajuste seu TXT.")
-
-    # --- Trades: usa read_csv com sep regex (sem for) ---
-    if trade_txt:
-        df_trades = pd.read_csv(
-            StringIO(trade_txt),
-            sep=r"[,\s]+",
-            engine="python",
-            header=None,
-            names=["Ativo", "Qt", "Data"],
-            usecols=[0, 1, 2]
-        )
-        df_trades["Ativo"] = df_trades["Ativo"].str.upper()
-        df_trades["Qt"] = pd.to_numeric(df_trades["Qt"], errors="coerce")
-        df_trades["Data"] = pd.to_datetime(df_trades["Data"], dayfirst=True, errors="coerce")
-        df_trades = df_trades.dropna(subset=["Ativo", "Qt"])
-    else:
-        df_trades = pd.DataFrame(columns=["Ativo", "Qt", "Data"])
-
-    return targets, df_trades
+    return targets, trades
 
 
-def _prices_from_crypto1d_fast(crypto_1d: dict, symbols: pd.Index) -> pd.Series:
-    """
-    Retorna Series PriceUSD indexada pelos símbolos (USD=1.0).
-    Sem loops explícitos: usa list comprehension + Series.
-    """
-    syms = pd.Index(symbols).unique()
-    prices = [
-        1.0 if s == "USD"
-        else (
-            float(crypto_1d[s]["Close"].iloc[-1])
-            if (s in crypto_1d and "Close" in crypto_1d[s].columns and len(crypto_1d[s]["Close"]) > 0)
-            else np.nan
-        )
-        for s in syms
-    ]
-    return pd.Series(prices, index=syms, name="PriceUSD")
+def mercado_do_ativo(s: str, criptos: tuple) -> str:
+    """Em qual mercado procurar o preço. Ordem: caixa > listas conhecidas > padrão de ticker da B3 > cripto/EUA."""
+    if s in CAIXAS:
+        return "Caixa"
+    if s in ACOES_B3:
+        return "Ações B3"
+    if s in ACOES_EUA:
+        return "Ações EUA"
+    if s in criptos:
+        return "Cripto"
+    if re.fullmatch(r"[A-Z]{4}\d{1,2}", s):          # ex.: BBDC4, KNRI11, AAPL34
+        return "Ações B3"
+    return "?"                                        # tenta cripto e, se não achar, ação dos EUA
 
 
-def _rebalance_fast(targets: dict, trades: pd.DataFrame, prices: pd.Series):
-    # quantidades atuais por símbolo (groupby vetorizado)
-    qty = trades.groupby("Ativo", as_index=True)["Qt"].sum() if not trades.empty else pd.Series(dtype=float)
+@st.cache_data(ttl="15m", show_spinner="Buscando preços e câmbio...")
+def precos_carteira(itens: tuple[tuple[str, str], ...]) -> tuple[dict, float]:
+    """Último preço de cada ativo na moeda original + câmbio (BRL por 1 USD, ticker BRL=X do Yahoo)."""
+    tickers = {"BRL=X"}
+    for s, m in itens:
+        if m == "Cripto":
+            tickers.add(ticker_yahoo(s, "Cripto"))
+        elif m in ("Ações B3", "Ações EUA"):
+            tickers.add(ticker_yahoo(s, m))
+        elif m == "?":
+            tickers |= {f"{s}-USD", s}
+    raw = yf.download(sorted(tickers), period="10d", interval="1d", group_by="ticker", auto_adjust=False,
+                      progress=False, threads=True)
 
-    # garante presença de todos os alvos
-    idx_all = pd.Index(sorted(set(qty.index) | set(targets.keys())))
-    qty = qty.reindex(idx_all, fill_value=0.0)
+    def ultimo(t):
+        try:
+            serie = raw[t]["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw["Close"]
+            serie = serie.dropna()
+            return float(serie.iloc[-1]) if len(serie) else np.nan
+        except KeyError:
+            return np.nan
 
-    price = prices.reindex(idx_all)
-    val = qty * price
+    fx = ultimo("BRL=X")
+    out = {}
+    for s, m in itens:
+        if m == "Caixa":
+            out[s] = (1.0, s, "caixa")
+        elif m == "Cripto":
+            out[s] = (ultimo(ticker_yahoo(s, "Cripto")), "USD", "Cripto")
+        elif m == "Ações B3":
+            out[s] = (ultimo(ticker_yahoo(s, m)), "BRL", "B3")
+        elif m == "Ações EUA":
+            out[s] = (ultimo(s), "USD", "EUA")
+        else:
+            p = ultimo(f"{s}-USD")
+            out[s] = (p, "USD", "Cripto") if np.isfinite(p) else (ultimo(s), "USD", "EUA")
+    return out, fx
+
+
+def _converter(preco: float, de: str, para: str, fx: float) -> float:
+    if de == para:
+        return preco
+    if de == "USD" and para == "BRL":
+        return preco * fx
+    return preco / fx                                 # BRL -> USD
+
+
+def _rebalancear(targets: dict, trades: pd.DataFrame, precos: pd.Series):
+    qty = trades.groupby("Ativo")["Qt"].sum() if not trades.empty else pd.Series(dtype=float)
+    idx = pd.Index(sorted(set(qty.index) | set(targets)))
+    qty = qty.reindex(idx, fill_value=0.0)
+    preco = precos.reindex(idx)
+    val = qty * preco
     total = float(val.replace([np.inf, -np.inf], np.nan).sum(skipna=True))
-
-    cur_pct = (val / total).fillna(0.0) if total > 0 else pd.Series(0.0, index=idx_all)
-    tgt_pct = pd.Series(targets, dtype=float).reindex(idx_all, fill_value=0.0)
-    tgt_val = tgt_pct * total
-
-    diff_usd = tgt_val - val
-    delta_units = diff_usd / price.replace(0, np.nan)
-
-    out = pd.DataFrame({
-        "Ativo": idx_all,
-        "Qt": qty.values,
-        "PriceUSD": price.values,
-        "ValueUSD": val.values,
-        "% Atual": cur_pct.values,
-        "% Alvo": tgt_pct.values,
-        "DiffUSD": diff_usd.values,
-        "DeltaUnits": delta_units.values
-    })
+    cur = (val / total).fillna(0.0) if total > 0 else pd.Series(0.0, index=idx)
+    tgt = pd.Series(targets, dtype=float).reindex(idx, fill_value=0.0)
+    diff = tgt * total - val
+    out = pd.DataFrame({"Ativo": idx, "Qt": qty.values, "Preco": preco.values, "Valor": val.values,
+                        "% Atual": cur.values, "% Alvo": tgt.values, "Ajuste": diff.values,
+                        "DeltaUnits": (diff / preco.replace(0, np.nan)).values})
     return out, total
 
-def exibir_rebalanceamento(crypto_1d, up, txt_manual):
 
-    content = up.read().decode("utf-8", errors="ignore") if up else txt_manual.strip()
+def exibir_rebalanceamento(criptos: tuple, up, txt_manual: str):
+    # getvalue() (e não read()) — read() esvazia o arquivo nos reruns seguintes
+    content = up.getvalue().decode("utf-8", errors="ignore") if up else (txt_manual or "").strip()
     if not content:
-        st.info("Envie um arquivo ou cole o conteúdo.")
-
-    targets, trades = _parse_txt_fast(content)
+        st.info("Envie um arquivo ou cole o conteúdo na barra lateral. Pode misturar cripto, ações da B3 "
+                "(ex.: ITUB4), ações dos EUA (ex.: NVDA) e caixa em USD ou BRL.")
+        return
+    targets, trades = _parse_txt(content)
+    base = st.radio("Ver carteira em", ["USD", "BRL"], horizontal=True,
+                    help="Tudo é convertido para esta moeda pelo câmbio do dia (USD/BRL do Yahoo Finance, "
+                         "ticker BRL=X). Cripto e ações dos EUA são cotadas em USD; ações e FIIs da B3, em BRL.")
+    sim = "US$" if base == "USD" else "R$"
 
     st.subheader("🧾 Aquisições")
-    st.dataframe(trades.sort_values("Data"), use_container_width=True, hide_index=True)
+    st.dataframe(trades.sort_values("Data"), hide_index=True)
 
-    syms = pd.Index(
-        sorted(set(list(targets.keys()) + trades["Ativo"].unique().tolist() if not trades.empty else [])))
-    prices = _prices_from_crypto1d_fast(crypto_1d, syms)
+    syms = sorted(set(targets) | set(trades["Ativo"]))
+    itens = tuple((s_, mercado_do_ativo(s_, criptos)) for s_ in syms)
+    cot, fx = precos_carteira(itens)
+    if not np.isfinite(fx):
+        st.error("Não consegui o câmbio USD/BRL agora; ativos em moedas diferentes não podem ser somados.")
+        return
+    precos = pd.Series({s_: _converter(p, m, base, fx) for s_, (p, m, _) in cot.items()}, dtype=float)
+    out, total = _rebalancear(targets, trades, precos)
+    out.insert(1, "Mercado", out["Ativo"].map(lambda a: cot.get(a, (0, "", "?"))[2]))
+    out.insert(3, "Preço original", out["Ativo"].map(
+        lambda a: f"{cot[a][1]} {ln.fmt(cot[a][0])}" if a in cot and np.isfinite(cot[a][0]) else "—"))
+    sem_preco = out.loc[out["Preco"].isna(), "Ativo"].tolist()
+    if sem_preco:
+        st.warning("Sem preço no Yahoo Finance (ficaram FORA do total): " + ", ".join(sem_preco) +
+                   ". Confira o código do ativo.")
 
-    out, total = _rebalance_fast(targets, trades, prices)
+    st.subheader(f"💰 Valor total: **{sim} {total:,.2f}**")
+    st.caption(f"Câmbio usado: 1 USD = {fx:,.4f} BRL (Yahoo Finance, BRL=X).")
 
-    st.subheader(f"💰 Valor total: **${total:,.2f}**")
-
-    show = out.copy()
-    show["% Atual"] = (show["% Atual"] * 100).round(2)
-    show["% Alvo"] = (show["% Alvo"] * 100).round(2)
-    show["PriceUSD"] = pd.to_numeric(show["PriceUSD"], errors="coerce").round(8)
-    show["ValueUSD"] = pd.to_numeric(show["ValueUSD"], errors="coerce").round(2)
-    show["DiffUSD"] = pd.to_numeric(show["DiffUSD"], errors="coerce").round(2)
-    show["DeltaUnits"] = pd.to_numeric(show["DeltaUnits"], errors="coerce").round(10)
-
+    show = out.assign(**{"% Atual": (out["% Atual"] * 100).round(2), "% Alvo": (out["% Alvo"] * 100).round(2)})
     st.subheader("Plano de Rebalanceamento")
-    st.dataframe(
-        show.rename(columns={
-            "Qt": "Qtd atual", "PriceUSD": "Preço (USD)",
-            "ValueUSD": "Valor (USD)",
-            "DiffUSD": "Ajuste USD", "DeltaUnits": "Δ Unidades"
-        }),
-        use_container_width=True, hide_index=True
-    )
+    st.dataframe(show.rename(columns={"Qt": "Qtd atual", "Preco": f"Preço ({base})", "Valor": f"Valor ({base})",
+                                      "Ajuste": f"Ajuste ({base})", "DeltaUnits": "Δ Unidades"}),
+                 hide_index=True, column_config={
+                     f"Preço ({base})": st.column_config.NumberColumn(format="%.4g"),
+                     f"Valor ({base})": st.column_config.NumberColumn(format="%.2f"),
+                     f"Ajuste ({base})": st.column_config.NumberColumn(format="%.2f")})
 
-    st.subheader("Ações sugeridas (exclui USD)")
-    if not out.empty:
-        mask_crypto = (out["Ativo"] != "USD") & out["DiffUSD"].notna()
-        buys = out.loc[mask_crypto & (out["DiffUSD"] > 0), ["Ativo", "DiffUSD", "DeltaUnits"]]
-        sells = out.loc[mask_crypto & (out["DiffUSD"] < 0), ["Ativo", "DiffUSD", "DeltaUnits"]]
-        col1, col2 = st.columns(2)
-        with col1:
-            st.write("**Comprar**")
-            st.dataframe(
-                buys.assign(DiffUSD=lambda d: d["DiffUSD"].round(2),
-                            DeltaUnits=lambda d: d["DeltaUnits"].round(10)),
-                use_container_width=True, hide_index=True
-            )
-        with col2:
-            st.write("**Vender**")
-            st.dataframe(
-                sells.assign(DiffUSD=lambda d: d["DiffUSD"].round(2),
-                             DeltaUnits=lambda d: d["DeltaUnits"].round(10)),
-                use_container_width=True, hide_index=True
-            )
+    st.subheader("Ações sugeridas (exclui caixa)")
+    ativos = ~out["Ativo"].isin(CAIXAS) & out["Ajuste"].notna()
+    c1, c2 = st.columns(2)
+    for col, titulo, mask in ((c1, "**Comprar**", out["Ajuste"] > 0), (c2, "**Vender**", out["Ajuste"] < 0)):
+        with col:
+            st.write(titulo)
+            st.dataframe(out.loc[ativos & mask, ["Ativo", "Mercado", "Ajuste", "DeltaUnits"]]
+                         .rename(columns={"Ajuste": f"Ajuste ({base})", "DeltaUnits": "Δ Unidades"})
+                         .round({f"Ajuste ({base})": 2}), hide_index=True)
+    st.divider()
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.pie(show, values="% Atual", names="Ativo", title="Distribuição Atual",
+                     color_discrete_sequence=px.colors.sequential.Tealgrn)
+        fig.update_traces(textposition="inside", textinfo="percent+label")
+        st.plotly_chart(fig.update_layout(showlegend=False))
+    with c2:
+        alvo = pd.DataFrame({"Ativo": list(targets), "% Alvo": list(targets.values())})
+        fig = px.pie(alvo, values="% Alvo", names="Ativo", title="Distribuição da Carteira Planejada",
+                     color_discrete_sequence=px.colors.sequential.RdBu)
+        fig.update_traces(textposition="inside", textinfo="percent+label")
+        st.plotly_chart(fig.update_layout(showlegend=False))
 
-        st.divider()
 
-        col1, col2 = st.columns(2)
+# =========================================================================== #
+# Extras
+# =========================================================================== #
 
-        with col1:
-            fig = px.pie(
-                show,
-                values="% Atual",
-                names="Ativo",
-                title="Distribuição Atual",
-                color_discrete_sequence=px.colors.sequential.Tealgrn
-            )
-            fig.update_traces(textposition="inside", textinfo="percent+label")
-            fig.update_layout(showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
-
-        with col2:
-            df_targets = pd.DataFrame([targets]).T.reset_index()
-            df_targets.columns = ["Ativo", "% Alvo"]
-            fig = px.pie(
-                df_targets,
-                values="% Alvo",
-                names="Ativo",
-                title="Distribuição da Carteira Planejada",
-                color_discrete_sequence=px.colors.sequential.RdBu
-            )
-            fig.update_traces(textposition="inside", textinfo="percent+label")
-            fig.update_layout(showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
-
-def mostrar_fear_and_greed():
+@st.cache_data(ttl="1h", show_spinner=False)
+def fear_and_greed():
     try:
-        resp = requests.get("https://api.alternative.me/fng/?limit=1")
-        data = resp.json()
-        valor = data['data'][0]['value']
-        classificacao = data['data'][0]['value_classification']
-        return valor, classificacao
-    except Exception as e:
-        st.error(f"Erro ao obter o indicador Fear & Greed: {e}")
-        return 0, 0
+        d = requests.get("https://api.alternative.me/fng/?limit=1", timeout=8).json()["data"][0]
+        return d["value"], d["value_classification"]
+    except Exception as e:  # noqa: BLE001
+        return "—", f"indisponível ({type(e).__name__})"
 
-def print_links_uteis():
-    st.markdown("### 🔗 Links Úteis — Análise de Mercado")
 
+def links_uteis():
     st.markdown("""
-        **📊 Indicadores Gerais**
-        - [**TVL (Total Value Locked)** — DefiLlama](https://defillama.com/)
-        - [**Market Cap & Dados** — CoinGecko](https://www.coingecko.com/pt)
-    
-        **🌐 Situação Macro da Criptoeconomia**
-        - [**Dashboard Macro Cripto** — SoSoValue](https://sosovalue.com/pt/dashboard/charts)
-    
-        **⚠️ Indicadores de Alerta**
-        - [**AHR999 Indicator** — linha verde = zona de oportunidade](https://sosovalue.com/pt/dashboard/ahr-999-indicator)
-        - [**ETF Fund Flow (1W)** — atenção a saídas 2 semanas seguidas](https://sosovalue.com/pt/dashboard/total-crypto-spot-etf-fund-flow-1w)
-        """)
+### 🔗 Links Úteis — Análise de Mercado
+**📊 Indicadores Gerais**
+- [**TVL (Total Value Locked)** — DefiLlama](https://defillama.com/)
+- [**Market Cap & Dados** — CoinGecko](https://www.coingecko.com/pt)
+
+**🌐 Situação Macro da Criptoeconomia**
+- [**Dashboard Macro Cripto** — SoSoValue](https://sosovalue.com/pt/dashboard/charts)
+
+**⚠️ Indicadores de Alerta**
+- [**AHR999 Indicator** — linha verde = zona de oportunidade](https://sosovalue.com/pt/dashboard/ahr-999-indicator)
+- [**ETF Fund Flow (1W)** — atenção a saídas 2 semanas seguidas](https://sosovalue.com/pt/dashboard/total-crypto-spot-etf-fund-flow-1w)
+""")
 
 
-def print_volume_review(token_sel):
-    if token_sel in lista_crypto_100:
-        st.warning(
-            f"⚠️ {token_sel}: Altcoin de **volume muito baixo**, geralmente pode estar relacionado "
-            "ao movimento de ativos com **alto volume**. Requer atenção redobrada."
-        )
-    elif token_sel in lista_crypto_50:
-        st.info(
-            f"ℹ️ {token_sel}: Altcoin de **volume relativamente baixo**, pode estar correlacionado "
-            "com movimentos de ativos de **alto volume**."
-        )
-    elif token_sel not in ['BTC', 'USD', 'USDT', 'XAUT']:
-        st.info(
-            f"ℹ️ {token_sel}: Altcoin de alto volume, pode estar correlacionado "
-            "com movimentos do BTC, que possui **volume maior**."
-        )
-
-    if token_sel in ['USD', 'USDT', 'XAUT']:
-        st.info(
-            f"ℹ️ {token_sel}: Stablecoin."
-        )
+def revisao_volume(token: str, top50: list, top100: list):
+    if token in ("USD", "USDT", "XAUT"):
+        st.info(f"ℹ️ {token}: Stablecoin.")
+    elif token in top100:
+        st.warning(f"⚠️ {token}: Altcoin de **volume muito baixo**, geralmente pode estar relacionado ao "
+                   "movimento de ativos com **alto volume**. Requer atenção redobrada.")
+    elif token in top50:
+        st.info(f"ℹ️ {token}: Altcoin de **volume relativamente baixo**, pode estar correlacionado com "
+                "movimentos de ativos de **alto volume**.")
+    elif token != "BTC":
+        st.info(f"ℹ️ {token}: Altcoin de alto volume, pode estar correlacionado com movimentos do BTC, "
+                "que possui **volume maior**.")
 
 
-################# CODE #################
+# =========================================================================== #
+# Período dos gráficos (slider de duas pontas, abaixo dos gráficos)
+# =========================================================================== #
 
-st.header('Cryptinho',anchor=False)
+def periodo_grafico(chave: str, idx: pd.DatetimeIndex, meses: int = MESES_GRAFICO) -> tuple:
+    """Período escolhido no slider ``chave``, ajustado aos limites dos dados.
+
+    É lido ANTES de desenhar o gráfico e o slider é criado DEPOIS (embaixo dele):
+    o valor vem do session_state da interação anterior. Padrão: últimos ``meses``.
+    Se o fim estava "colado" no último candle, continua colado quando chegam dados novos.
+    """
+    lo, hi = idx[0].date(), idx[-1].date()
+    padrao = (max(lo, (idx[-1] - pd.DateOffset(months=meses)).date()), hi)
+    val = st.session_state.get(chave)
+    if val and len(val) == 2:
+        a, b = val
+        if b == st.session_state.get(f"{chave}_hi"):
+            b = hi
+        a, b = min(max(a, lo), hi), min(max(b, lo), hi)
+        val = (a, b) if a < b else padrao
+    else:
+        val = padrao
+    st.session_state[chave] = val
+    st.session_state[f"{chave}_hi"] = hi
+    return pd.Timestamp(val[0]), pd.Timestamp(val[1])
+
+
+def slider_periodo(chave: str, idx: pd.DatetimeIndex, ajuda: str | None = None):
+    st.slider("Período dos gráficos", min_value=idx[0].date(), max_value=idx[-1].date(), key=chave,
+              format="DD/MM/YYYY", help=ajuda or f"Padrão: últimos {MESES_GRAFICO} meses. Os indicadores e "
+                                                 "sinais continuam calculados com todo o histórico.")
+
+
+# =========================================================================== #
+# Aba: Análise por Linhas
+# =========================================================================== #
+
+@st.cache_data(ttl=TTL, show_spinner=False, max_entries=500)
+def calcular_linhas(chave: tuple, freq: str, token: str, p: ln.ParamsLinhas, backtest: bool,
+                    ini: str | None = None, fim: str | None = None) -> dict:
+    """Linhas calculadas só no período escolhido no slider (padrão: últimos 36 meses)."""
+    df = preparar_dados(*chave)[freq][token].loc[ini:fim]
+    return ln.analisar(df, p, backtest=backtest)
+
+
+def agregar_backtest(tabelas: list[pd.DataFrame]) -> pd.DataFrame:
+    """Soma os testes de vários tokens e recalcula taxa, IC e base (ponderada)."""
+    tabs = [t for t in tabelas if t is not None and not t.empty]
+    if not tabs:
+        return pd.DataFrame()
+    if len(tabs) == 1:
+        return tabs[0]
+    t = pd.concat(tabs, ignore_index=True)
+    t["rep"] = t["Repique %"] / 100 * t["Testes"]
+    t["base"] = t["Base aleatória %"] / 100 * t["Testes"]
+    g = t.groupby(["Tipo", "Toques antes do teste"], as_index=False)[["Testes", "rep", "base"]].sum()
+    lo, hi = ln.wilson(g["rep"].to_numpy(), g["Testes"].to_numpy(float))
+    taxa, base = g["rep"] / g["Testes"], g["base"] / g["Testes"]
+    return pd.DataFrame({
+        "Tipo": g["Tipo"], "Toques antes do teste": g["Toques antes do teste"], "Testes": g["Testes"],
+        "Repique %": (100 * taxa).round(1),
+        "IC95% (min-máx)": [f"{100 * a:.0f}–{100 * b:.0f}" for a, b in zip(lo, hi)],
+        "Base aleatória %": (100 * base).round(1), "Edge (p.p.)": (100 * (taxa - base)).round(1),
+    })
+
+
+def agregar_reteste(tabelas: list[pd.DataFrame]) -> pd.DataFrame:
+    """Soma os casos de rompimento/reteste de vários tokens."""
+    tabs = [t for t in tabelas if t is not None and not t.empty]
+    if not tabs:
+        return pd.DataFrame()
+    if len(tabs) == 1:
+        return tabs[0]
+    t = pd.concat(tabs, ignore_index=True)
+    t["ac"] = t["Acerto %"] / 100 * t["Casos"]
+    t["bs"] = t["Base aleatória %"] / 100 * t["Casos"]
+    g = t.groupby(["Operação", "Entrada"], as_index=False)[["Casos", "ac", "bs"]].sum()
+    lo, hi = ln.wilson(g["ac"].to_numpy(), g["Casos"].to_numpy(float))
+    taxa, base = g["ac"] / g["Casos"], g["bs"] / g["Casos"]
+    return pd.DataFrame({
+        "Operação": g["Operação"], "Entrada": g["Entrada"], "Casos": g["Casos"].astype(int),
+        "Acerto %": (100 * taxa).round(1), "IC95% (min-máx)": [f"{100 * a:.0f}–{100 * b:.0f}" for a, b in zip(lo, hi)],
+        "Base aleatória %": (100 * base).round(1), "Edge (p.p.)": (100 * (taxa - base)).round(1),
+    }).sort_values(["Operação", "Entrada"], ascending=[True, False], ignore_index=True)
+
+
+MODOS = {"toques": "Mais toques = mais forte",
+         "virgem": "Menos testada = mais forte",
+         "calibrado": "Calibrado pelo backtest do ativo"}
+
+
+@st.fragment
+def aba_linhas(chave: tuple, freq: str, token: str, tokens: list):
+    """Fragmento: mexer nos controles daqui reexecuta só esta aba."""
+    diario = freq == "1D"
+    with st.expander("⚙️ Parâmetros das linhas", expanded=False):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            sens = st.slider("Sensibilidade dos pivôs (barras de cada lado)", 2, 15, 3,
+                             help="Maior = só topos/fundos mais relevantes (e confirmação mais atrasada).")
+            prom = st.slider("Proeminência mínima do pivô (× tolerância)", 0.0, 6.0, 1.0, 0.5)
+        with c2:
+            tol = st.slider("Tolerância do preço (× ATR)", 0.2, 1.5, 0.5, 0.1,
+                            help="Distância máxima para contar como toque, e para considerar rompimento.")
+            tol_rsi = st.slider("Tolerância do RSI (pontos)", 0.5, 5.0, 2.0, 0.5)
+        with c3:
+            max_l = st.slider("Linhas ativas por tipo", 1, 6, 3)
+            modo = st.radio("Força das linhas", list(MODOS), format_func=MODOS.get)
+        with c4:
+            log = st.toggle("Preço em escala log", True)
+            zonas = st.toggle("Zonas horizontais", True)
+
+    p = ln.ParamsLinhas(
+        esquerda=sens, direita=sens, prom_min=prom, tol_atr=tol, tol_rsi=tol_rsi, max_linhas=max_l,
+        modo_forca=modo, log=log, gap_min=max(2 * sens, 6),
+        span_max=400 if diario else 150, meia_vida=90 if diario else 26,
+        janela_rompidas=40 if diario else 12, projecao=30 if diario else 12,
+        janela_reteste=120 if diario else 26,
+    )
+    df_todo = preparar_dados(*chave)[freq][token]
+    ini, fim = periodo_grafico("periodo_linhas", df_todo.index)
+    df = df_todo.loc[ini:fim]
+    if len(df) < 60:
+        st.warning("Período curto demais para traçar linhas: amplie o intervalo no seletor abaixo.")
+        slider_periodo("periodo_linhas", df_todo.index)
+        return
+    faixa = (ini.date().isoformat(), fim.date().isoformat())
+    res = calcular_linhas(chave, freq, token, p, False, *faixa)
+
+    f1, f2, f3 = st.columns([1, 2, 1])
+    usar_fibo = f1.toggle("📐 Fibonacci", value=False,
+                          help="Retração de Fibonacci entre a mínima e a máxima do PERÍODO escolhido no seletor "
+                               "abaixo do gráfico. Mude o período para ancorar em outro fundo/topo.")
+    fibo = None
+    if usar_fibo:
+        dir_fibo = f2.radio("Direção", ["auto", "fundo_topo", "topo_fundo"], horizontal=True,
+                            format_func={"auto": "Automática", "fundo_topo": "Fundo → topo",
+                                         "topo_fundo": "Topo → fundo"}.get,
+                            help="Automática: segue a ordem em que o fundo e o topo aconteceram no período. "
+                                 "Fundo → topo: 0 no fundo e 1 no topo (extensões acima). "
+                                 "Topo → fundo: 0 no topo e 1 no fundo (extensões abaixo).")
+        ext_fibo = f3.checkbox("Extensões (1,272 · 1,618 · 2 · 2,618)", value=False)
+        fibo = ln.fibonacci(df, dir_fibo, ext_fibo)
+
+    st.plotly_chart(ln.figura_linhas(df, res, token, freq, len(df), mostrar_zonas=zonas, fibo=fibo), theme=None)
+    if fibo:
+        baixo_, alto_ = fibo["entre"]
+        desc = (f"fundo {ln.fmt(fibo['baixo'])} em {fibo['i_baixo']:%d/%m/%Y} → topo {ln.fmt(fibo['alto'])} em "
+                f"{fibo['i_alto']:%d/%m/%Y}" if fibo["direcao"] == "fundo_topo" else
+                f"topo {ln.fmt(fibo['alto'])} em {fibo['i_alto']:%d/%m/%Y} → fundo {ln.fmt(fibo['baixo'])} em "
+                f"{fibo['i_baixo']:%d/%m/%Y}")
+        if baixo_ and alto_:
+            onde = (f"entre **{baixo_[0]:g}** ({ln.fmt(baixo_[1])}) e **{alto_[0]:g}** ({ln.fmt(alto_[1])})")
+        elif baixo_:
+            onde = f"acima do nível **{baixo_[0]:g}** ({ln.fmt(baixo_[1])})"
+        else:
+            onde = f"abaixo do nível **{alto_[0]:g}** ({ln.fmt(alto_[1])})"
+        st.caption(f"Fibonacci: {desc}. Preço atual ({ln.fmt(float(df['Close'].iloc[-1]))}) {onde}.")
+    slider_periodo("periodo_linhas", df_todo.index,
+                   ajuda="As linhas são calculadas só com os candles deste período.")
+
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        st.markdown("**Linhas selecionadas**")
+        st.dataframe(ln.tabela_linhas(res), hide_index=True, column_config={
+            "Score": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f"),
+            "Valor agora": st.column_config.NumberColumn(format="%.4g"),
+        })
+        st.caption("Distância em unidades de tolerância (preço: ×ATR; RSI: pontos). Positiva = do lado "
+                   "'certo' da linha (acima do suporte / abaixo da resistência; numa linha ROMPIDA, do lado "
+                   "novo: acima da LTB rompida, abaixo da LTA perdida). No gráfico, a linha pontilhada é a "
+                   "continuação da rompida, já com o papel trocado; ✕ = rompimento, ◆R = reteste.")
+    with c2:
+        st.markdown("**Sinais por linhas (candle atual)**")
+        if res["sinais"].empty:
+            st.info("Nenhum toque ou rompimento relevante agora.")
+        else:
+            st.dataframe(res["sinais"], hide_index=True, column_config={
+                "Força": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f")})
+
+    with st.expander("📊 Backtest: toques anteriores × probabilidade de repique (este ativo)"):
+        st.caption(
+            "Cada vez que o preço volta a uma linha é um teste. Repique = andar 2×tolerância a favor da linha "
+            "antes de andar 2×tolerância contra, em até 20 barras. 'Base aleatória' é a mesma conta feita em "
+            "qualquer barra: só há vantagem real quando o repique fica acima da base e fora do intervalo de "
+            "confiança. Para linhas do RSI o resultado é medido no PREÇO.")
+        c_bt, c_ag = st.columns(2)
+        rodar = c_bt.toggle("Rodar backtest")
+        agregado = c_ag.toggle("Agregar todos os tokens", help="Um ativo sozinho tem poucos testes com 4+ toques; "
+                               "somando a lista inteira os intervalos de confiança ficam bem mais estreitos.")
+        if rodar:
+            alvo = tokens if agregado else [token]
+            a, b = st.columns(2)
+            resultados = [calcular_linhas(chave, freq, t, p, True, *faixa) for t in alvo]
+            st.markdown("**Toques em linhas ativas (repique)**")
+            a, b = st.columns(2)
+            for col, serie, nome in ((a, "preco", "Linhas no preço"), (b, "rsi", "Linhas no RSI")):
+                with col:
+                    st.markdown(f"{nome}" + (f" · {len(alvo)} tokens" if agregado else ""))
+                    tab = agregar_backtest([r[serie]["tabela"] for r in resultados])
+                    if tab.empty:
+                        st.info("Poucos eventos.")
+                    else:
+                        st.dataframe(tab, hide_index=True)
+            st.markdown("**Rompimento × reteste: entrar no rompimento ou esperar o reteste?**")
+            st.caption("Compra = LTB/resistência rompida para cima; venda = LTA/suporte perdido. Acerto = "
+                       "andar 2×tolerância a favor antes de 2×tolerância contra, em até 20 barras.")
+            a, b = st.columns(2)
+            for col, serie, nome in ((a, "preco", "Linhas no preço"), (b, "rsi", "Linhas no RSI (medido no preço)")):
+                with col:
+                    st.markdown(nome)
+                    tab = agregar_reteste([r[serie]["tabela_reteste"] for r in resultados])
+                    if tab.empty:
+                        st.info("Poucos eventos.")
+                    else:
+                        st.dataframe(tab, hide_index=True)
+
+    with st.expander("🔎 Scanner: sinais por linhas em todos os tokens"):
+        if st.toggle("Escanear lista inteira"):
+            barra = st.progress(0.0)
+            partes = []
+            for k, tok in enumerate(tokens):
+                s = calcular_linhas(chave, freq, tok, p, False, *faixa)["sinais"]
+                if not s.empty:
+                    partes.append(s.assign(Token=tok))
+                barra.progress((k + 1) / len(tokens))
+            barra.empty()
+            if partes:
+                tab = pd.concat(partes, ignore_index=True)[["Token", "Lado", " ", "Sinal", "Força"]]
+                st.dataframe(tab.sort_values("Força", ascending=False), hide_index=True, column_config={
+                    "Força": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f")})
+            else:
+                st.info("Nenhum sinal por linhas agora.")
+
+
+# =========================================================================== #
+# Aba: Indicadores × ML
+# =========================================================================== #
+
+@st.cache_data(ttl="6h", show_spinner=False)
+def fear_greed_historico() -> pd.Series:
+    """Histórico diário do Medo & Ganância (alternative.me, desde 01/02/2018)."""
+    try:
+        dados_ = requests.get("https://api.alternative.me/fng/?limit=0&format=json", timeout=15).json()["data"]
+        s_ = pd.Series({pd.to_datetime(int(d["timestamp"]), unit="s").normalize(): float(d["value"])
+                        for d in dados_})
+        return s_.sort_index()
+    except Exception:  # noqa: BLE001
+        return pd.Series(dtype=float)
+
+
+@st.cache_data(ttl=TTL, show_spinner=False, max_entries=12)
+def base_indicadores(chave: tuple, prazo: int, so_token: str | None) -> pd.DataFrame:
+    d1 = preparar_dados(*chave)["1D"]
+    diarios = {s_: df[OHLCV] for s_, df in d1.items() if so_token in (None, s_)}
+    cripto = len(chave) < 4 or chave[3] == "Cripto"
+    return ml.montar_base(diarios, prazo, fear_greed_historico() if cripto else None)
+
+
+@st.cache_resource
+def _memo_ml() -> dict:
+    return {}
+
+
+def analisar_ml(chave: tuple, prazo: int, so_token: str | None, grupos: tuple, tarefa: str, familia: str,
+                progresso=None):
+    """Resultado guardado por configuração (com barra de progresso na 1ª vez)."""
+    memo = _memo_ml()
+    k = (id(preparar_dados(*chave)), chave, prazo, so_token, grupos, tarefa, familia)
+    if k not in memo:
+        base = base_indicadores(chave, prazo, so_token)
+        cols = [c for c in ml.INDICADORES if ml.GRUPO[c] in grupos]
+        memo[k] = ml.analisar(base, cols, prazo, tarefa, familia, progresso)
+        while len(memo) > 12:
+            memo.pop(next(iter(memo)))
+    return memo[k]
+
+
+AJUDA_TAREFA = """
+**Compra × venda (classificação)** — o modelo responde a uma pergunta de sim ou não: *"daqui a N dias o
+preço vai estar mais alto do que hoje?"*. O resultado é uma **chance de alta (%)** e um **sinal**:
+
+- 🟢 **COMPRA** quando a chance está entre as 25% mais altas que o modelo costuma dar;
+- 🔴 **VENDA** quando está entre as 25% mais baixas;
+- ⚪ **neutro** no meio.
+
+**Variação em % (regressão)** — o modelo tenta prever **quanto** o preço vai variar em N dias (ex.: +3,2%).
+Serve para comparar ativos entre si, mas o erro costuma ser grande: a variação real fica, em geral, bem
+longe da prevista. O sinal é só o sentido da previsão (alta ou queda).
+"""
+
+AJUDA_PRAZO = """
+Quantos dias à frente o modelo olha.
+
+- **7 dias**: movimentos curtos — mais casos para aprender, mas muito ruído.
+- **14 dias**: meio-termo (padrão).
+- **30 dias**: tendência — menos ruído, mas menos casos independentes no histórico (e o mercado muda de
+  fase no meio do caminho).
+
+Referência: em cripto o preço sobe em ~50–55% dos períodos de 14 dias, então acertar 60% já é muito.
+"""
+
+AJUDA_MODELO = """
+**Automático (recomendado)**: treina os três abaixo, cada um em três níveis de complexidade, e fica com o
+que teve o **melhor AUC (compra × venda) ou a melhor correlação de Spearman (variação %) na validação**
+(dados que ele não viu).
+
+**Gradient Boosting** — 100 árvores de decisão pequenas, treinadas em sequência: cada uma corrige o erro
+das anteriores. Bom para regras combinadas como *"RSI < 30 E Medo & Ganância < 25"*. Aceita dado faltando.
+
+**Random Forest** — 100 árvores independentes, cada uma com uma amostra diferente dos dados; a resposta é a
+média. Mais estável, decora menos o passado.
+
+**Regressão logística / linear (Ridge)** — soma ponderada dos indicadores (cada um ganha um peso, positivo
+ou negativo). O mais simples e fácil de interpretar, mas não capta combinações.
+
+Complexidade: nas árvores, quantos níveis de perguntas cada árvore pode fazer (1 nível = uma pergunta só,
+tipo *"RSI < 35?"*); no linear, quanta liberdade os pesos têm. Mais complexo aprende mais detalhes — e
+também mais ruído.
+"""
+
+AJUDA_MOEDAS = """
+**Todos juntos** (recomendado): um único modelo aprende com o histórico de todos os ativos do mercado
+selecionado na barra lateral (cripto, B3 ou EUA; stablecoins ficam de fora). São muito mais exemplos e
+vários ciclos de alta e baixa, então o padrão encontrado tende a ser mais confiável.
+
+**Só o ativo selecionado**: aprende apenas com o histórico dele. Pode captar um comportamento próprio do
+ativo, mas com poucos dados o risco de achar padrão por acaso é bem maior.
+"""
+
+AJUDA_GRUPOS = """
+Grupos que o modelo pode usar (ele mesmo testa quais combinações ajudam):
+
+- **RSI**: RSI diário (14 candles diários), RSI semanal (14 candles semanais, último candle já fechado) e
+  divergência RSI × preço nos últimos 10 dias.
+- **Médias móveis**: distância do preço às MME 50 e 200, MME 50 vs MME 200 (cruzamento), Pi Cycle
+  (MME 111 ÷ 2×MME 350).
+- **Volume**: volume do dia ÷ média de 20 dias; pico de volume (> 2× a média) nos últimos 3 dias, com alta
+  ou com queda.
+- **Medo & Ganância**: valor do índice (0–100) e quanto ele mudou em 7 dias (dados desde 2018).
+- **LTA / LTB**: distância do preço à LTA e à LTB mais recentes (retas pelos 2 últimos fundos/topos) e
+  distância do RSI às LTA/LTB do próprio RSI.
+"""
+
+AJUDA_NOTA = {
+    "cls": "AUC (área sob a curva ROC): a chance de o modelo dar uma probabilidade de alta maior para um dia "
+           "que de fato subiu do que para um dia que caiu. 0,50 = cara ou coroa; 1,00 = perfeito. "
+           "Em mercado, 0,53–0,56 já é considerado bom.",
+    "reg": "Correlação de Spearman entre a variação prevista e a real: mede se o modelo ORDENA bem quem vai "
+           "subir mais (usa a posição no ranking, não o valor, então não é distorcida por dias extremos). "
+           "0 = acaso; 1 = ordem perfeita; negativo = ordem invertida. Em mercado, 0,05–0,10 já é bom.",
+}
+
+
+@st.fragment
+def aba_ml(chave: tuple, token: str):
+    st.caption("Treina um modelo com **RSI, médias móveis, volume, Medo & Ganância e LTA/LTB** (candles diários) "
+               "e confere se ele acerta em meses que **não viu**. Passe o mouse no ❔ de cada opção para detalhes.")
+    c1, c2, c3, c4 = st.columns([1.4, 0.8, 1.2, 1.1])
+    tarefa = c1.radio("O que prever", list(ml.TAREFAS), format_func=ml.TAREFAS.get, help=AJUDA_TAREFA)
+    prazo = c2.selectbox("Prazo", [7, 14, 30], index=1, format_func=lambda d: f"{d} dias", help=AJUDA_PRAZO)
+    opcoes_mod = ["auto"] + list(ml.FAMILIAS)
+    familia = c3.selectbox("Modelo", opcoes_mod, help=AJUDA_MODELO,
+                           format_func=lambda f: "Automático (melhor na validação)" if f == "auto"
+                           else ml.nome_modelo(f, tarefa))
+    so_tok = c4.radio("Ativos", ["Todos juntos", f"Só {token}"], help=AJUDA_MOEDAS)
+    cripto = len(chave) < 4 or chave[3] == "Cripto"
+    grupos_ok = ml.GRUPOS if cripto else [g for g in ml.GRUPOS if g != "Medo & Ganância"]
+    grupos = st.multiselect("Indicadores que o modelo pode usar", grupos_ok, default=grupos_ok, help=AJUDA_GRUPOS)
+    if not cripto:
+        st.caption("O índice de Medo & Ganância (alternative.me) é do mercado cripto, então não entra para ações.")
+    if not grupos:
+        st.info("Escolha pelo menos um grupo de indicadores.")
+        return
+    so_token = None if so_tok == "Todos juntos" else token
+    barra = st.progress(0.0, "Montando os indicadores...")
+    try:
+        res = analisar_ml(chave, prazo, so_token, tuple(grupos), tarefa, familia,
+                          progresso=lambda f, t: barra.progress(min(f, 1.0), t))
+    except ValueError as e:
+        barra.empty()
+        st.error(str(e))
+        return
+    barra.empty()
+    base = base_indicadores(chave, prazo, so_token)
+    t = res["teste"]
+    cls = tarefa == "cls"
+    if res["sem_dado"]:
+        st.warning("Sem dados para: " + ", ".join(ml.NOME[c] for c in res["sem_dado"]) +
+                   ". (O Medo & Ganância vem de api.alternative.me; se o site não respondeu, ele fica de fora.)")
+
+    # ---------------- modelo usado
+    fam = res["fam"]
+    st.info(f"**Modelo usado: {res['modelo']}** ({ml.descricao_complexidade(fam, res['valor'])}) · prevendo "
+            f"**{ml.TAREFAS[tarefa].lower()}** em **{prazo} dias** · indicadores: "
+            f"**{' + '.join(res['grupos_escolhidos']) if res['grupos_escolhidos'] else ' + '.join(grupos)}**"
+            f"{' (escolhidos pelo ML)' if res['grupos_escolhidos'] else ''}.\n\n{ml.FAMILIAS[fam]['desc']}")
+
+    # ---------------- 1. dá para confiar?
+    st.subheader("1 · Ele acertou em meses que não viu?")
+    if cls:
+        ok_ = t["nota"] >= 0.52 and (t["acerto_compra"] - (1 - t["acerto_venda"])) >= 0.04
+        fraco = t["nota"] >= 0.51
+    else:
+        ok_ = t["nota"] >= 0.05 and t["ret_top"] > t["ret_fundo"]
+        fraco = t["nota"] >= 0.02 and t["ret_top"] > t["ret_fundo"]
+    if ok_:
+        st.success("✅ O padrão se repetiu no período de teste. É um sinal fraco (mercado é muito aleatório): "
+                   "use como filtro junto com sua análise, não como gatilho sozinho.")
+    elif fraco:
+        st.warning("🟡 Sinal fraco: no teste ficou só um pouco acima do acaso. Use com cautela.")
+    else:
+        st.error("❌ No teste não acertou mais que o acaso: não use o sinal deste modelo para decidir. "
+                 "As tabelas de combinações abaixo continuam valendo como estatística histórica.")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric(f"{ml.METRICA[tarefa]} no teste", f"{t['nota']:.3f}", f"{t['nota'] - t['nota_val']:+.3f} vs validação",
+              delta_color="off", help=AJUDA_NOTA[tarefa])
+    if cls:
+        caiu_todos = 1 - t["subiu_todos"]
+        m2.metric("Quando deu 🟢 COMPRA, subiu", "—" if np.isnan(t["acerto_compra"]) else f"{100 * t['acerto_compra']:.0f}%",
+                  f"{100 * (t['acerto_compra'] - t['subiu_todos']):+.0f} p.p. vs um dia qualquer",
+                  help=f"{t['n_compra']} sinais de compra no teste. Num dia qualquer do teste o preço subiu "
+                       f"{100 * t['subiu_todos']:.0f}% das vezes.")
+        m3.metric("Quando deu 🔴 VENDA, caiu", "—" if np.isnan(t["acerto_venda"]) else f"{100 * t['acerto_venda']:.0f}%",
+                  f"{100 * (t['acerto_venda'] - caiu_todos):+.0f} p.p. vs um dia qualquer",
+                  help=f"{t['n_venda']} sinais de venda no teste. Num dia qualquer do teste o preço caiu "
+                       f"{100 * caiu_todos:.0f}% das vezes.")
+        m4.metric(f"Variação média em {prazo}d após COMPRA", "—" if np.isnan(t["ret_compra"]) else f"{100 * t['ret_compra']:+.1f}%",
+                  f"após VENDA: {100 * t['ret_venda']:+.1f}%", delta_color="off",
+                  help=f"Em todos os dias do teste: {100 * t['ret_todos']:+.1f}%. Sem taxas.")
+    else:
+        m2.metric("Acertou a direção", f"{100 * t['acerto_direcao']:.0f}%",
+                  help=f"Previu alta e subiu, ou previu queda e caiu. Só 'sempre alta' acertaria "
+                       f"{100 * max(t['subiu_todos'], 1 - t['subiu_todos']):.0f}%.")
+        m3.metric("20% maiores previsões → variação real", f"{100 * t['ret_top']:+.1f}%",
+                  f"20% menores: {100 * t['ret_fundo']:+.1f}%", delta_color="off",
+                  help="Se o modelo ordena bem, os ativos/dias com previsão mais alta devem ter subido mais.")
+        m4.metric("Erro típico da previsão", f"±{100 * t['erro_tipico']:.1f} p.p.",
+                  f"chutando a média: ±{100 * t['erro_ingenuo']:.1f}", delta_color="off",
+                  help="Diferença mediana entre a variação prevista e a real. Se não for menor que 'chutando "
+                       "a média', a previsão do valor em si não ajuda (mesmo que a ordem ajude).")
+    st.caption(f"Teste: {t['inicio']:%d/%m/%Y} a {t['fim']:%d/%m/%Y} · {t['n']:,} dias-ativo · "
+               f"{res['n_tokens']} ativo(s). O modelo foi escolhido só com os dados anteriores a esse período.")
+
+    with st.expander("Como o modelo e os indicadores foram escolhidos (treino × validação)"):
+        st.markdown(
+            "**Passo 1 — indicadores.** Começa sem nada e adiciona um grupo por vez (com o Gradient Boosting mais "
+            f"simples), só se o **{ml.METRICA[tarefa]} de validação** melhorar mais que o ruído. Validação = média de 4 janelas de "
+            "tempo do período anterior ao teste, sempre treinando com o passado e testando no futuro.")
+        if not res["selecao"].empty:
+            st.dataframe(res["selecao"], hide_index=True, column_config={
+                c: st.column_config.NumberColumn(format="%.3f") for c in (f"{ml.METRICA[tarefa]} validação", "± erro padrão")})
+        else:
+            st.caption("Nenhum grupo melhorou a validação sozinho; o modelo usa todos os escolhidos por você.")
+        st.markdown(
+            "**Passo 2 — modelo e complexidade.** Cada modelo é testado em 3 níveis de complexidade. "
+            "**Treino muito acima da validação = decorou o passado (overfitting); os dois baixos = simples demais "
+            "(underfitting).** Em cada modelo fica o nível mais simples que não perde para os outros; entre os "
+            "modelos, vence a maior validação (⭐).")
+        cmp_ = res["comparacao"]
+        st.plotly_chart(ml.fig_comparacao(cmp_, tarefa), theme=None)
+        met = ml.METRICA[tarefa]
+        ren = {"Treino": f"{met} treino", "Validação": f"{met} validação", "Pior janela": f"{met} pior janela"}
+        st.dataframe(cmp_[["Modelo", "Complexidade", "Treino", "Validação", "± erro padrão", "Pior janela", "Escolhido"]]
+                     .rename(columns=ren), hide_index=True,
+                     column_config={c: st.column_config.NumberColumn(format="%.3f")
+                                    for c in list(ren.values()) + ["± erro padrão"]})
+
+    # ---------------- 2. o que pesa e como
+    st.subheader("2 · O que mais pesa e para que lado")
+    a, b = st.columns([2, 3])
+    a.plotly_chart(ml.fig_importancia(res["importancia"], tarefa), theme=None)
+    a.caption(f"Peso = quanto o {ml.METRICA[tarefa]} cai quando o indicador é embaralhado (importância por "
+              "permutação, medida no teste). Zero ou negativo = não ajudou.")
+    ref = 100 * (t["subiu_todos"] if cls else t["ret_todos"])
+    b.plotly_chart(ml.fig_efeitos(res, ref=ref), theme=None)
+    b.caption(("Como a chance de alta muda" if cls else "Como a variação prevista muda") +
+              " conforme cada indicador (os outros fixos). Pontilhado = média de todos os dias. "
+              "Curva quase reta = o indicador pouco muda a previsão.")
+
+    # ---------------- 3. combinações históricas
+    st.subheader("3 · Combinações de indicadores que mais funcionaram")
+    at = res["comb"].attrs
+    st.caption("Faixas de 1 ou 2 indicadores em que o preço " + ("subiu mais (ou menos) que o normal" if cls else
+               "variou mais (ou menos) que o normal") + " no período **antes** do teste "
+               f"(média: {100 * at.get('base_dev', np.nan):.0f}% de altas, {100 * at.get('ret_dev', np.nan):+.1f}% "
+               "de variação) e o que aconteceu **no teste**. Como muitas combinações são testadas, algumas parecem "
+               "boas por sorte: confie mais nas ✅. 'Dias' conta dias-ativo; dias seguidos se parecem, então o "
+               "número real de casos independentes é menor.")
+    ca, cb = st.tabs(["🟢 Favoráveis à compra", "🔴 Favoráveis à venda"])
+    for aba_, lado in ((ca, "alta"), (cb, "queda")):
+        with aba_:
+            tab = ml.tabela_combinacoes(res["comb"], lado, tarefa, 15, res["cods_agora"])
+            if tab.empty:
+                st.info("Poucos dados para combinações.")
+            else:
+                st.dataframe(tab, hide_index=True)
+
+    # ---------------- 4. explorar um par
+    st.subheader("4 · Cruzar dois indicadores")
+    opcoes = [c for c in res["cols_todas"] if c in res["faixas"]]
+    if len(opcoes) >= 2:
+        k1, k2, k3 = st.columns([2, 2, 1])
+        pa = k1.selectbox("Linhas", opcoes, index=opcoes.index("rsi") if "rsi" in opcoes else 0,
+                          format_func=ml.NOME.get)
+        resto = [c for c in opcoes if c != pa]
+        pref = "fg" if "fg" in resto else ("dist_ltb" if "dist_ltb" in resto else resto[0])
+        pb = k2.selectbox("Colunas", resto, index=resto.index(pref), format_func=ml.NOME.get)
+        per = k3.radio("Período", ["todo", "antes", "teste"],
+                       help="'antes' = onde se procura o padrão; 'teste' = meses recentes, para ver se se repetiu.")
+        mp = ml.mapa_par(base, res, pa, pb, per)
+        cods = res["cods_agora"].get(token, {})
+        ia, ib = cods.get(pa, -1), cods.get(pb, -1)
+        if ia >= 0 and ib >= 0:
+            n, sb, cb_ = mp["cnt"][ia, ib], mp["sub"][ia, ib], mp["cai"][ia, ib]
+            onde = (f"**📍 {token} agora:** {ml.NOME[pa]} **{mp['rot_a'][ia]}** · {ml.NOME[pb]} **{mp['rot_b'][ib]}**")
+            if n >= 30:
+                st.info(f"{onde} → nesse cruzamento, {prazo} dias depois o preço **subiu {100 * sb / n:.0f}%** e "
+                        f"**caiu {100 * cb_ / n:.0f}%** das vezes ({sb} / {cb_} dias); variação média "
+                        f"{mp['ret_med'][ia, ib]:+.1f}%. Média geral: subiu {mp['base_pct']:.0f}%.")
+            else:
+                st.info(f"{onde} → poucos dias históricos nesse cruzamento ({n}) para tirar conclusão.")
+        else:
+            st.info(f"{token} está sem dado em um dos dois indicadores agora.")
+        st.plotly_chart(ml.fig_mapa(mp, ml.NOME[pa], ml.NOME[pb], token, (ia, ib), mostrar_ret=not cls),
+                        theme=None)
+        st.caption(f"Cada célula: **▲ % de vezes que subiu / ▼ % que caiu** em {prazo} dias; embaixo, "
+                   f"**dias de alta / dias de queda**" + (" e a variação média" if not cls else "") +
+                   f". Verde = sobe mais que a média ({mp['base_pct']:.0f}%), vermelho = sobe menos. "
+                   "Células com menos de 30 dias ficam sem cor.")
+
+    # ---------------- 5. agora
+    st.subheader("5 · Leitura de agora")
+    ag = res["agora"]
+    linha = ag[ag["Token"] == token]
+    aviso = "" if (ok_ or fraco) else " — ⚠️ modelo sem acerto comprovado"
+    if not linha.empty:
+        r0 = linha.iloc[0]
+        if cls:
+            st.metric(f"{token} · sinal do modelo ({prazo} dias){aviso}", r0["Sinal"], f"chance de alta {r0['Chance de alta %']:.0f}%",
+                      delta_color="off", help=f"COMPRA se a chance ≥ {100 * res['limites_agora'][0]:.0f}%, VENDA se "
+                                              f"≤ {100 * res['limites_agora'][1]:.0f}% (25% mais altas / mais baixas "
+                                              "que o modelo costuma dar).")
+        else:
+            st.metric(f"{token} · variação prevista em {prazo} dias{aviso}", f"{r0['Variação prevista %']:+.1f}%",
+                      f"erro típico ±{100 * t['erro_tipico']:.0f} p.p.", delta_color="off")
+    a, b = st.columns([3, 2])
+    with a:
+        st.markdown(f"**{token}: cada indicador hoje e o que aconteceu historicamente nessa faixa**")
+        lt = ml.leitura_token(res, base, token)
+        if lt.empty:
+            st.info(f"{token} não entra nesta análise (stablecoin ou histórico curto).")
+        else:
+            st.dataframe(lt, hide_index=True, column_config={
+                "Subiu % nessa faixa": st.column_config.NumberColumn(format="%.1f"),
+                "Variação média %": st.column_config.NumberColumn(format="%+.2f")})
+    with b:
+        st.markdown("**Todos os ativos**")
+        st.dataframe(ag.style.apply(_destacar(token), axis=1), hide_index=True)
+        st.caption("Só use o sinal se o item 1 estiver verde.")
+
+
+# =========================================================================== #
+# App
+# =========================================================================== #
+
+st.header("Cryptinho", anchor=False)
+
+simbolos = ler_simbolos()
 
 with st.sidebar:
-
-    st.text('Para o rebalanceador de carteira:')
-
+    st.text("Para o rebalanceador de carteira:")
     up_ = st.file_uploader("Envie .txt da sua carteira", type=["txt"])
     txt_manual_ = st.text_area(
-        "…ou cole aqui",
-        height=150,
-        placeholder="BTC 0.5\nETH 0.25\n@\nBTC, 0.1, 03/11/2025\nBTC, 0.05, 01/11/2025\nETH, 3, 01/11/2025\nUSD, 1000, 01/11/2025"
-    )
-
-    exemplo_txt = """
-    # Fazer carteira com, nas primeiras linhas o ativo com a % desejada para ele (o resto será considerado caixa em USD), termine a seção com um '@'. ex.: BTC 0.5
-    # Nas linhas seguintes, o ativo, as unidades adquiridas de um ativo e a data de aquisição. ex.: BTC, 0.005, 01/11/2025 
-
-    BTC 0.5
-    ETH 0.25
-    @
-    BTC, 0.1, 03/11/2025
-    BTC, 0.05, 01/11/2025
-    ETH, 3, 03/11/2025
-    USD, 1000, 01/11/2025
-    """
-
-    st.download_button(
-        "Baixar exemplo de carteira (.txt)",
-        data=exemplo_txt,
-        file_name="carteira_exemplo.txt",
-        mime="text/plain"
-    )
-
+        "…ou cole aqui", height=150,
+        placeholder="BTC 0.4\nETH 0.1\nITUB4 0.2\nNVDA 0.2\n@\nBTC, 0.1, 03/11/2025\nETH, 3, 01/11/2025\n"
+                    "ITUB4, 200, 05/11/2025\nNVDA, 15, 05/11/2025\nBRL, 5000, 01/11/2025\nUSD, 1000, 01/11/2025")
+    st.download_button("Baixar exemplo de carteira (.txt)", file_name="carteira_exemplo.txt", mime="text/plain",
+                       data=("# Nas primeiras linhas, o ativo e a % desejada (o resto vira caixa); termine com '@'.\n"
+                             "# Depois: ativo, unidades adquiridas, data. Pode misturar cripto (BTC), ações da B3\n"
+                             "# (ITUB4, HGLG11), ações dos EUA (NVDA) e caixa (USD ou BRL).\n\n"
+                             "BTC 0.4\nETH 0.1\nITUB4 0.2\nNVDA 0.2\n@\nBTC, 0.1, 03/11/2025\n"
+                             "ETH, 3, 03/11/2025\nITUB4, 200, 05/11/2025\nNVDA, 15, 05/11/2025\n"
+                             "BRL, 5000, 01/11/2025\nUSD, 1000, 01/11/2025\n"))
     st.divider()
+    st.text("Para os indicadores:")
+    mercado = st.radio("Mercado", list(MERCADOS), horizontal=True,
+                       help="Cripto = lista do add_symbols.txt (cotação em USD). Ações B3 em BRL e Ações EUA em "
+                            "USD = listas ACOES_B3 / ACOES_EUA no início do código.")
+    usar_ultima = st.checkbox("Usar última data", value=True, help="Se desmarcado, selecionar última data")
+    data_maxima = None if usar_ultima else st.date_input(
+        "Selecione última data", value=pd.Timestamp.today().date(), format="DD/MM/YYYY").isoformat()
+    periodicidade = st.radio("Periodicidade", options=["1D", "1W"], index=1, horizontal=True,
+                             help="Dados diários (1D) ou semanais (1W)")
 
-    st.text('Para os indicadores:')
+lista = {"Cripto": simbolos, "Ações B3": ACOES_B3, "Ações EUA": ACOES_EUA}[mercado]
+moeda = MERCADOS[mercado]
+chave = (lista, PERIODO, data_maxima, mercado)
+dados = preparar_dados(*chave)
+tokens = list(dados["1D"])
+if not tokens:
+    st.error(f"Nenhum dado baixado para {mercado}. Verifique a conexão ou a lista de símbolos.")
+    st.stop()
 
-    DATA_MAXIMA = None
+with st.sidebar:
+    token_sel = st.selectbox("Selecione o ativo", options=tokens, index=0)
+    if st.button("🔄 Atualizar dados agora"):
+        baixar_ohlc.clear()
+        preparar_dados.clear()
+        st.rerun()
 
-    DATA_MAXIMA_CHECK = st.checkbox('Usar última data', value=True, help='Se desmarcado, selecionar última data')
+top25, top50, top100 = faixas_volume(dados["1D"]) if mercado == "Cripto" else ([], [], [])
 
-    if DATA_MAXIMA_CHECK:
-        DATA_MAXIMA = None
-    else:
-        DATA_MAXIMA = st.date_input("Selecione última data", value=pd.Timestamp.today().date(), format="DD/MM/YYYY")
-
-    periodo = "36mo"
-
-    periodicidade = st.radio(
-        "Periodicidade",
-        options=["1D", "1W"],
-        index=1,
-        horizontal=True,
-        help="Escolha entre dados diários (1D) ou semanais (1W)"
-    )
-
-    try:
-        token_sel = st.selectbox("Selecione o token", options=lista_crypto, index=0)
-    except:
-        token_sel = st.selectbox("Selecione o token", options=['BTC'], index=0)
-
-
-
-
-for key in ["crypto_1d", "crypto_1w", "crypto_1m", "DATA_MAXIMA_CACHE"]:
-    if key not in st.session_state:
-        st.session_state[key] = np.nan
-
-if st.session_state["DATA_MAXIMA_CACHE"] != DATA_MAXIMA:
-    with st.spinner('Carregando...'):
-
-        # Obtém dados diários, semanais e mensais corretamente
-        crypto_1d = fetch_crypto_data(lista_crypto, periodo, "1d", DATA_MAXIMA)  # Diário
-        crypto_1w = fetch_crypto_data(lista_crypto, "36mo", "1s", DATA_MAXIMA)  # Semanal (pulando 7 dias)
-        crypto_1m = fetch_crypto_data(lista_crypto, "36mo", "1m", DATA_MAXIMA)  # Mensal (pegando o último dia de cada mês)
-
-        # Fear and Greed
-        valor_fg, classificacao_fg = mostrar_fear_and_greed()
-
-        st.session_state["crypto_1d"] = crypto_1d
-        st.session_state["crypto_1w"] = crypto_1w
-        st.session_state["crypto_1m"] = crypto_1m
-        st.session_state["valor_fg"] = valor_fg
-        st.session_state["classificacao_fg"] = classificacao_fg
-        st.session_state["DATA_MAXIMA_CACHE"] = DATA_MAXIMA
-else:
-    crypto_1d = st.session_state["crypto_1d"]
-    crypto_1w = st.session_state["crypto_1w"]
-    crypto_1m = st.session_state["crypto_1m"]
-    valor_fg = st.session_state["valor_fg"]
-    classificacao_fg = st.session_state["classificacao_fg"]
-
-with st.spinner('Processando...'):
-
-    # cria uma Series com o último volume de cada símbolo
-    last_vol = pd.Series({sym: df['Volume'].iloc[-1] for sym, df in crypto_1w.items()})
-
-    # aplica as faixas diretamente (vetorizado)
-    lista_crypto_25  = last_vol.index[last_vol > 4e8].tolist()
-    lista_crypto_50  = last_vol.index[(last_vol > 6e7) & (last_vol <= 4e8)].tolist()
-    lista_crypto_100 = last_vol.index[last_vol <= 6e7].tolist()
-
-    (sinais_compra_geral, sinais_venda_geral,
-                sinais_compra_25, sinais_venda_25,
-                sinais_compra_50, sinais_venda_50,
-                sinais_compra_100, sinais_venda_100,
-                df_buy_sell_ratio, df_agregado_compra_venda,
-                variacoes_preco_1S_str) = analisar_sinais_cripto(crypto_1d, "1d", lista_crypto,
-                               crypto_1d, crypto_1w, crypto_1m,
-                               lista_crypto_25, lista_crypto_50, lista_crypto_100)
-
-    (sinais_compra_geral_1w, sinais_venda_geral_1w,
-                sinais_compra_25_1w, sinais_venda_25_1w,
-                sinais_compra_50_1w, sinais_venda_50_1w,
-                sinais_compra_100_1w, sinais_venda_100_1w,
-                df_buy_sell_ratio_1w, df_agregado_compra_venda_1w,
-                variacoes_preco_1S_str_1w) = analisar_sinais_cripto(crypto_1w, "1w", lista_crypto,
-                               crypto_1d, crypto_1w, crypto_1m,
-                               lista_crypto_25, lista_crypto_50, lista_crypto_100)
+ABAS = ["Carteira", "Indicadores", "Análise por Linhas", "Indicadores × ML"]
+try:   # abas preguiçosas (Streamlit recente): só a aberta é executada
+    tab_carteira, tab_indicadores, tab_linhas, tab_ml = st.tabs(ABAS, on_change="rerun")
+except TypeError:
+    tab_carteira, tab_indicadores, tab_linhas, tab_ml = st.tabs(ABAS)
 
 
-    tab_carteira, tab_indicadores = st.tabs(
-        ["Carteira","Indicadores"]
-    )
+def _aberta(tab) -> bool:
+    return getattr(tab, "open", True) is not False
 
+
+if _aberta(tab_indicadores):
     with tab_indicadores:
-
+        sinais, resumo = analisar_sinais(chave, periodicidade)
+        df_tok = dados[periodicidade][token_sel]
         col1, col2 = st.columns([2, 1])
-
-        if periodicidade == '1D':
-            with col1:
-                st.subheader(f"📈 Gráficos {periodicidade}")
-                plot_weekly_with_indicators(
-                    token_sel=token_sel,
-                    s_close=crypto_1d[token_sel]['Close'],
-                    s_date=crypto_1d[token_sel]['Date'],
-                    compute_missing = True  # calcula EMA50, EMA200 e RSI(14)
-                )
-                plot_with_semicircles(crypto_1w[token_sel]['Close'], crypto_1w[token_sel]['Date'], token_sel=token_sel)
-            with col2:
-                exibir_sinais_streamlit(
-                    sinais_compra_25, sinais_venda_25,
-                    sinais_compra_50, sinais_venda_50,
-                    sinais_compra_100, sinais_venda_100,
-                    variacoes_preco_1S_str,
-                    sinais_compra_geral, sinais_venda_geral,
-                    df_buy_sell_ratio, df_agregado_compra_venda, token_sel, periodicidade
-                )
-
-                print_volume_review(token_sel)
-
+        with col1:
+            st.subheader(f"📈 Gráficos {periodicidade}")
+            ini, fim = periodo_grafico("periodo_indicadores", df_tok.index)
+            grafico_indicadores(df_tok.loc[ini:fim], token_sel, periodicidade, moeda)
+            grafico_semiciclos(dados["1W"][token_sel].loc[ini:fim], token_sel, moeda=moeda)
+            slider_periodo("periodo_indicadores", df_tok.index)
+        with col2:
+            exibir_sinais(sinais, resumo, token_sel, periodicidade)
+            if mercado == "Cripto":
+                revisao_volume(token_sel, top50, top100)
+                valor_fg, classe_fg = fear_and_greed()
                 st.subheader("⚡ Fear & Greed Index")
                 st.write(f"**Valor:** {valor_fg}")
-                st.write(f"**Classificação:** {classificacao_fg}")
+                st.write(f"**Classificação:** {classe_fg}")
+                links_uteis()
+            else:
+                st.caption(f"Preços em {moeda}. Ações só negociam em dias úteis: '7D' = 7 dias corridos.")
 
-                print_links_uteis()
+if _aberta(tab_linhas):
+    with tab_linhas:
+        aba_linhas(chave, periodicidade, token_sel, tokens)
 
-        elif periodicidade == '1W':
-            with col1:
-                st.subheader(f"📈 Gráficos {periodicidade}")
-                plot_weekly_with_indicators(
-                    token_sel=token_sel,
-                    s_close=crypto_1w[token_sel]['Close'],
-                    s_date=crypto_1w[token_sel]['Date'],
-                    compute_missing = True  # calcula EMA50, EMA200 e RSI(14)
-                )
-                plot_with_semicircles(crypto_1w[token_sel]['Close'], crypto_1w[token_sel]['Date'], token_sel=token_sel)
-            with col2:
-                exibir_sinais_streamlit(
-                    sinais_compra_25_1w, sinais_venda_25_1w,
-                    sinais_compra_50_1w, sinais_venda_50_1w,
-                    sinais_compra_100_1w, sinais_venda_100_1w,
-                    variacoes_preco_1S_str_1w,
-                    sinais_compra_geral_1w, sinais_venda_geral_1w,
-                    df_buy_sell_ratio_1w, df_agregado_compra_venda_1w, token_sel, periodicidade
-                )
+if _aberta(tab_ml):
+    with tab_ml:
+        aba_ml(chave, token_sel)
 
-                print_volume_review(token_sel)
-
-                st.subheader("⚡ Fear & Greed Index")
-                st.write(f"**Valor:** {valor_fg}")
-                st.write(f"**Classificação:** {classificacao_fg}")
-
-                print_links_uteis()
-
-
-    ###
-
+if _aberta(tab_carteira):
     with tab_carteira:
-
         st.header("🧮 Rebalanceador de Carteira")
-        exibir_rebalanceamento(crypto_1d, up_, txt_manual_)
-
-
-
-
-
-
+        exibir_rebalanceamento(simbolos, up_, txt_manual_)
