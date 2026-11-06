@@ -75,7 +75,12 @@ def usd_em_btc(b: pd.DataFrame) -> pd.DataFrame:
 def baixar_yahoo(simbolos: tuple[str, ...], periodo: str = "max", mercado: str = "Cripto") -> dict[str, pd.DataFrame]:
     import yfinance as yf                          # só no PC
     tickers = sorted({ticker_yahoo(s, mercado) for s in simbolos})
-    raw = yf.download(tickers, period=periodo, group_by="ticker", auto_adjust=False, progress=False, threads=True)
+    janela = {"period": periodo}
+    if periodo.endswith("y") and periodo[:-1].isdigit() and periodo not in ("1y", "2y", "5y", "10y"):
+        # o Yahoo só aceita 1y/2y/5y/10y/max como período: para "30y" pede a partir da data equivalente
+        inicio = pd.Timestamp.today().normalize() - pd.DateOffset(years=int(periodo[:-1]))
+        janela = {"start": inicio.strftime("%Y-%m-%d")}
+    raw = yf.download(tickers, **janela, group_by="ticker", auto_adjust=False, progress=False, threads=True)
     out = {}
     for s in simbolos:
         t = ticker_yahoo(s, mercado)
