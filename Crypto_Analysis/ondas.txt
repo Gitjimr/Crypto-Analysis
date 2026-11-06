@@ -1,0 +1,15 @@
+# Ondas do gráfico "Close + Ondas Simétricas" (aba Indicadores)
+# Edite os valores abaixo e recarregue o app. Linhas com # são comentários.
+#
+# inicio          = data (AAAA-MM-DD) em que UMA das ondas começa; as outras se repetem
+#                   para trás e para frente a partir dela
+# largura_semanas = duração de cada onda, do vale ao vale seguinte (aceita decimal, ex.: 27.5)
+#
+# Dica: ajuste com os sliders abaixo do gráfico e copie para cá os valores mostrados.
+
+# Original:
+# inicio = 2025-03-02
+# largura_semanas = 28
+
+inicio = 2025-01-10
+largura_semanas = 28
