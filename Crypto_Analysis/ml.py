@@ -25,6 +25,8 @@ teste = últimos ~20%, que o modelo não vê. Todos os atributos são causais
 """
 from __future__ import annotations
 
+import sys
+import warnings
 from itertools import combinations
 
 import numpy as np
@@ -45,10 +47,17 @@ from plotly.subplots import make_subplots
 
 import linhas as ln
 
+# no navegador (Pyodide) não há processos/threads: tudo em 1 núcleo
+N_JOBS = 1 if sys.platform == "emscripten" else -1
+
 ESTAVEIS = {"USD", "USDT", "USDC", "XAUT", "DAI", "FDUSD", "TUSD", "PAXG"}
-GRUPOS = ["RSI", "Médias móveis", "Volume", "Medo & Ganância", "LTA / LTB"]
+GRUPOS = ["RSI", "Médias móveis", "Volume", "Medo & Ganância", "LTA / LTB", "MACD", "OBV / fluxo"]
+# Padrão da aba (testado no BTC, 2017–2026, com o último ano fora do treino): OBV / fluxo foi o grupo que mais
+# ajudou; Médias móveis e LTA / LTB somaram; RSI, Volume e MACD não acrescentaram (o MACD repete as médias).
+# Rompimentos/ADX (máx./mín. de 55 dias, DI+ − DI−) também foi testado e piorou o resultado, então ficou de fora.
+GRUPOS_PADRAO = ["Médias móveis", "LTA / LTB", "OBV / fluxo"]
 COR_GRUPO = {"RSI": "#9575cd", "Médias móveis": "#ffb74d", "Volume": "#4fc3f7",
-             "Medo & Ganância": "#f06292", "LTA / LTB": "#81c784"}
+             "Medo & Ganância": "#f06292", "LTA / LTB": "#81c784", "MACD": "#e57373", "OBV / fluxo": "#4db6ac"}
 
 FX_RSI = ([0, 30, 40, 50, 60, 70, 100], ["< 30", "30–40", "40–50", "50–60", "60–70", "> 70"])
 FX_FG = ([0, 25, 45, 55, 75, 100], ["Medo extremo (0–25)", "Medo (25–45)", "Neutro (45–55)",
@@ -72,6 +81,12 @@ INDICADORES: dict[str, tuple] = {
     "dist_ltb": ("Preço vs LTB (+ = rompida)", "LTA / LTB", "%", None),
     "rsi_vs_lta": ("RSI vs LTA do RSI", "LTA / LTB", " pts", None),
     "rsi_vs_ltb": ("RSI vs LTB do RSI", "LTA / LTB", " pts", None),
+    "macd": ("MACD (% do preço)", "MACD", "%", None),
+    "macd_hist": ("MACD − sinal (% do preço)", "MACD", "%", None),
+    "macd_cruz": ("Cruzamento do MACD (5 dias)", "MACD", "", {-1: "para baixo", 0: "nenhum", 1: "para cima"}),
+    "obv20": ("OBV vs média de 20 dias", "OBV / fluxo", " desv.", None),
+    "obv50": ("OBV vs média de 50 dias", "OBV / fluxo", " desv.", None),
+    "cmf": ("Chaikin Money Flow (20 dias)", "OBV / fluxo", "", None),
 }
 NOME = {k: v[0] for k, v in INDICADORES.items()}
 GRUPO = {k: v[1] for k, v in INDICADORES.items()}
@@ -146,6 +161,20 @@ def atributos(df: pd.DataFrame, fg: pd.Series | None = None, sens: int = 3) -> p
     r = rsi.to_numpy()
     x["rsi_vs_lta"] = r - _linha_recente(r, r, sens, sens, "baixo")
     x["rsi_vs_ltb"] = r - _linha_recente(r, r, sens, sens, "alto")
+
+    # MACD (12, 26, 9) em % do preço, para comparar ativos de preços diferentes
+    macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
+    hist = macd - macd.ewm(span=9, adjust=False).mean()
+    x["macd"], x["macd_hist"] = 100 * macd / c, 100 * hist / c
+    sobe = ((hist > 0) & (hist.shift(1) <= 0)).astype(float).rolling(5, min_periods=1).max()
+    desce = ((hist < 0) & (hist.shift(1) >= 0)).astype(float).rolling(5, min_periods=1).max()
+    x["macd_cruz"] = (sobe - desce).where(np.arange(n) >= 35)
+    # OBV: distância às médias em "desvios típicos" da variação diária do OBV (escala comparável entre ativos)
+    obv = (np.sign(c.diff()).fillna(0) * v).cumsum()
+    esc = obv.diff().rolling(50).std().replace(0, np.nan)
+    x["obv20"], x["obv50"] = (obv - obv.rolling(20).mean()) / esc, (obv - obv.rolling(50).mean()) / esc
+    mfv = ((c - l) - (h - c)) / (h - l).replace(0, np.nan) * v
+    x["cmf"] = mfv.rolling(20).sum() / v.rolling(20).sum().replace(0, np.nan)
     return pd.DataFrame(x, index=df.index).replace([np.inf, -np.inf], np.nan)
 
 
@@ -162,6 +191,12 @@ def montar_base(diarios: dict[str, pd.DataFrame], prazo: int, fg: pd.Series | No
         ret[:-prazo] = c[prazo:] - c[:-prazo]
         a["ret"] = ret
         a["y"] = np.where(np.isnan(ret), np.nan, (ret > 0).astype(float))
+        passado = np.full(len(c), np.nan)               # só para diagnóstico (não é atributo do modelo)
+        passado[prazo:] = c[prazo:] - c[:-prazo]
+        a["ret_passado"] = passado
+        a["preco"] = d["Close"].to_numpy(float)
+        a["maxima"] = d["High"].to_numpy(float)
+        a["minima"] = d["Low"].to_numpy(float)
         a = a.iloc[60:]                                # aquecimento do RSI/volume
         a.insert(0, "token", tok)
         partes.append(a)
@@ -176,8 +211,15 @@ def montar_base(diarios: dict[str, pd.DataFrame], prazo: int, fg: pd.Series | No
 # Divisão por data
 # =========================================================================== #
 
-def dividir(datas: pd.Series, prazo: int, k: int = 4, frac_teste: float = 0.2):
+# "Esquecer" o último ano no treino. Testado no BTC (walk-forward 2017–2026): o ano mais recente puxa o modelo para o
+# movimento que acabou de acontecer (ele passa a seguir a tendência e erra nas viradas); sem ele, o sinal deixou de
+# ficar abaixo do acaso nos prazos de 14 e 30 dias e nas duas metades do período.
+EMBARGO = 365
+
+
+def dividir(datas: pd.Series, prazo: int, k: int = 4, frac_teste: float = 0.2, embargo: int = EMBARGO):
     gap = pd.Timedelta(days=prazo + 1)
+    gap_tr = gap + pd.Timedelta(days=embargo)          # treino termina `embargo` dias antes da validação
     ud = np.sort(datas.unique())
     corte = pd.Timestamp(ud[int(len(ud) * (1 - frac_teste))])
     d = datas.to_numpy()
@@ -187,11 +229,14 @@ def dividir(datas: pd.Series, prazo: int, k: int = 4, frac_teste: float = 0.2):
     for j in range(1, k + 1):
         if not len(blocos[j]):
             continue
-        tr = d < np.datetime64(pd.Timestamp(blocos[j][0]) - gap)
+        tr = d < np.datetime64(pd.Timestamp(blocos[j][0]) - gap_tr)
         va = (d >= blocos[j][0]) & (d <= blocos[j][-1])
         if tr.sum() > 300 and va.sum() > 50:
             dobras.append((tr, va))
-    return dobras, dev, d >= np.datetime64(corte), corte
+    dev_tr = d < np.datetime64(corte - gap_tr)          # treino do teste final
+    if dev_tr.sum() < 300:
+        dev_tr = dev
+    return dobras, dev, d >= np.datetime64(corte), corte, dev_tr
 
 
 # =========================================================================== #
@@ -381,7 +426,7 @@ class Modelo(BaseEstimator):
         if self.fam == "rf":
             Est = RandomForestClassifier if cls else RandomForestRegressor
             est = Est(n_estimators=100, max_depth=self.valor, max_features="sqrt", max_samples=0.3,
-                      min_samples_leaf=int(np.clip(self.n_treino // 200, 20, 200)), n_jobs=-1, random_state=0)
+                      min_samples_leaf=int(np.clip(self.n_treino // 200, 20, 200)), n_jobs=N_JOBS, random_state=0)
         else:
             est = (LogisticRegression(C=self.valor, max_iter=2000) if cls
                    else Ridge(alpha=1.0 / self.valor))
@@ -437,8 +482,8 @@ def analisar(base: pd.DataFrame, cols: list[str], prazo: int, tarefa: str = "cls
     base = base.reset_index(drop=True)
     alvo = "y" if tarefa == "cls" else "ret"
     lab = base[alvo].notna().to_numpy()
-    dobras, dev, te, corte = dividir(base["Date"], prazo)
-    dev_l, te_l = dev & lab, te & lab
+    dobras, dev, te, corte, dev_tr = dividir(base["Date"], prazo)
+    dev_l, te_l, dtr_l = dev & lab, te & lab, dev_tr & lab
     sem_dado = [c for c in cols if base.loc[dev_l, c].nunique() < 2]
     cols = [c for c in cols if c not in sem_dado]
     if not cols:
@@ -518,8 +563,8 @@ def analisar(base: pd.DataFrame, cols: list[str], prazo: int, tarefa: str = "cls
 
     # --- 3) teste final (uma vez)
     prog(0.72, "Teste final")
-    m = Modelo(tarefa, fam, valor, int(dev_l.sum())).fit(X[dev_l], y[dev_l])
-    p_dev = m.saida(X[dev_l])
+    m = Modelo(tarefa, fam, valor, int(dtr_l.sum())).fit(X[dtr_l], y[dtr_l])
+    p_dev = m.saida(X[dtr_l])
     p_te = m.saida(X[te_l])
     y_te = y[te_l].to_numpy()
     r_te = np.expm1(base.loc[te_l, "ret"].to_numpy())
@@ -582,14 +627,18 @@ def analisar(base: pd.DataFrame, cols: list[str], prazo: int, tarefa: str = "cls
     fx = faixas(base.loc[dev], todas)
     comb = combinacoes(base, todas, fx, dev, te, min_dev=max(150, int(0.004 * dev_l.sum())))
 
-    # --- 7) leitura de agora: mesmo modelo, treinado com todo o histórico
+    # --- 7) leitura de agora: mesmo modelo, treinado com todo o histórico menos o último ano (EMBARGO)
     prog(0.96, "Leitura de agora")
-    m_all = Modelo(tarefa, fam, valor, int(lab.sum())).fit(X[lab], y[lab])
+    ate = base["Date"].max() - pd.Timedelta(days=prazo + 1 + EMBARGO)
+    lab_all = lab & (base["Date"] <= ate).to_numpy()
+    if lab_all.sum() < 300:
+        lab_all = lab
+    m_all = Modelo(tarefa, fam, valor, int(lab_all.sum())).fit(X[lab_all], y[lab_all])
     ult = base.groupby("token").tail(1)
     o = m_all.saida(ult[cols])
     agora = pd.DataFrame({"Token": ult["token"].to_numpy(), "Data": ult["Date"].dt.date.to_numpy()})
     if tarefa == "cls":
-        p_all = m_all.saida(X[lab])
+        p_all = m_all.saida(X[lab_all])
         lc, lv = np.quantile(p_all, 0.75), np.quantile(p_all, 0.25)
         agora["Sinal"] = np.where(o >= lc, "🟢 COMPRA", np.where(o <= lv, "🔴 VENDA", "⚪ neutro"))
         agora["Chance de alta %"] = (100 * o).round(1)
@@ -611,27 +660,417 @@ def analisar(base: pd.DataFrame, cols: list[str], prazo: int, tarefa: str = "cls
             "n_tokens": int(base["token"].nunique()), "cols": cols, "cols_todas": todas, "sem_dado": sem_dado}
 
 
+# =========================================================================== #
+# Histórico do sinal: como a "Leitura de agora" teria se saído no passado
+# =========================================================================== #
+
+def historico_sinal(base: pd.DataFrame, cols: list[str], prazo: int, tarefa: str, fam: str, valor,
+                    passo: int = 30, anos: int = 6, progresso=None, embargo: int = EMBARGO) -> pd.DataFrame:
+    """Simula o uso real do app: em cada data D (a cada `passo` dias, nos últimos `anos`), treina o modelo
+    escolhido SÓ com o que já se sabia em D (alvos até D − prazo) e registra o sinal que ele daria em cada
+    dia de D a D + passo, para todos os ativos. É o teste honesto da 'Leitura de agora'."""
+    prog = progresso or (lambda *_: None)
+    base = base.reset_index(drop=True)
+    alvo = "y" if tarefa == "cls" else "ret"
+    datas = base["Date"]
+    lab = base[alvo].notna().to_numpy()
+    primeiro, ultimo = datas.min(), datas.max()
+    inicio = max(primeiro + pd.Timedelta(days=730 + embargo), ultimo - pd.Timedelta(days=365 * anos))
+    grade = pd.date_range(inicio, ultimo, freq=f"{passo}D")
+    partes = []
+    for i, D in enumerate(grade):
+        prog(i / max(len(grade), 1), f"Refazendo o passado: {D:%m/%Y}")
+        tr = lab & (datas <= D - pd.Timedelta(days=prazo + 1 + embargo)).to_numpy()
+        ap = ((datas > D) & (datas <= D + pd.Timedelta(days=passo))).to_numpy()
+        if tr.sum() < 300 or not ap.any():
+            continue
+        m = Modelo(tarefa, fam, valor, int(tr.sum())).fit(base.loc[tr, cols], base.loc[tr, alvo])
+        p = m.saida(base.loc[ap, cols])
+        if tarefa == "cls":
+            p_tr = m.saida(base.loc[tr, cols])
+            lc, lv = np.quantile(p_tr, 0.75), np.quantile(p_tr, 0.25)
+            sinal = np.where(p >= lc, "COMPRA", np.where(p <= lv, "VENDA", "neutro"))
+            normal = float(base.loc[tr, "y"].mean())
+        else:
+            sinal = np.where(p > 0, "COMPRA", "VENDA")
+            normal = float(base.loc[tr, "ret"].mean())
+        partes.append(pd.DataFrame({"Date": datas[ap].to_numpy(), "token": base.loc[ap, "token"].to_numpy(),
+                                    "p": p, "sinal": sinal, "normal": normal, "treino_ate": D,
+                                    "y": base.loc[ap, "y"].to_numpy(), "ret": base.loc[ap, "ret"].to_numpy(),
+                                    "ret_passado": base.loc[ap, "ret_passado"].to_numpy(),
+                                    "preco": base.loc[ap, "preco"].to_numpy(),
+                                    "rsi": base.loc[ap, "rsi"].to_numpy(),
+                                    "maxima": base.loc[ap, "maxima"].to_numpy(),
+                                    "minima": base.loc[ap, "minima"].to_numpy()}))
+    prog(1.0, "Pronto")
+    return pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
+
+
+def extremos(preco: pd.Series, ordem: int = 10) -> tuple[list, list]:
+    """Fundos e topos: mínimos/máximos do fechamento SEMANAL com ±`ordem` semanas de cada lado (devolve o dia
+    exato do extremo). Só confirmados: nas pontas da série ainda não dá para saber, então ficam de fora."""
+    from scipy.signal import argrelextrema
+    preco = preco.dropna()
+    sem = preco.resample("W").last().dropna()
+    out = []
+    for op, f in ((np.less_equal, "idxmin"), (np.greater_equal, "idxmax")):
+        ix = argrelextrema(sem.to_numpy(), op, order=ordem)[0] if len(sem) > 2 * ordem else np.array([], int)
+        ix = ix[(ix >= ordem) & (ix < len(sem) - ordem)]
+        dias = []
+        for t in sem.index[ix]:
+            trecho = preco.loc[t - pd.Timedelta(days=6):t]
+            d = getattr(trecho, f)() if len(trecho) else t
+            if not dias or (d - dias[-1]).days > 14:          # platôs geram vizinhos repetidos
+                dias.append(d)
+        out.append(dias)
+    return out[0], out[1]
+
+
+def viradas(preco: pd.Series, ordem: int = 10, janela: int = 21) -> pd.Series:
+    """'fundo' / 'topo' para dias a até `janela` dias de um extremo (ver `extremos`) — só para avaliar o
+    passado: usa o futuro para saber onde foram os fundos e topos."""
+    out = pd.Series("meio", index=preco.index)
+    for nome, dias in zip(("fundo", "topo"), extremos(preco, ordem)):
+        for t in dias:
+            out[(out.index >= t - pd.Timedelta(days=janela)) & (out.index <= t + pd.Timedelta(days=janela))] = nome
+    return out
+
+
+# Calibrados em 31 criptos (Coin Metrics, 2014–2026), não só no BTC. As quedas e altas são medidas em desvios da
+# PRÓPRIA volatilidade do ativo, então a mesma régua serve para BTC e para altcoins bem mais nervosas — volume,
+# volatilidade, idade e tendência do ativo quase não explicaram onde o alerta foi melhor ou pior.
+ALERTA_RSI, ALERTA_Z = 35, 2.0     # alerta de fundo: RSI diário < 35 E queda de ≥ 2 "desvios de 30 dias"
+FUNDO_FORTE_Z = 3.0                # alerta de fundo FORTE: a mesma regra com queda de ≥ 3 desvios (mais raro e certeiro)
+# Topo: perdeu a EMA50 depois de alta de ≥ 2,5 desvios nos 60 dias anteriores (ou divergência de baixa).
+# Alternativa testada: EMA20 / 3 desvios / 90 dias ficou acima do acaso em 27 das 31 criptos (contra 23), mas um pouco
+# pior no BTC (+7,7 contra +9,3 na média de 7/14/30 dias). Nenhuma característica do ativo (volatilidade, volume,
+# idade, tendência) indicou qual das duas serve para cada um, então ficou a original.
+TOPO_Z, TOPO_DIAS, TOPO_EMA = 2.5, 60, 50
+
+
+def _desvios(preco: pd.Series, ref: pd.Series) -> pd.Series:
+    """Distância do preço a `ref` medida em desvios típicos de 30 dias do próprio ativo (log)."""
+    vol = np.log(preco).diff().rolling("90D", min_periods=60).std()
+    return np.log(preco / ref) / (vol * np.sqrt(30))
+
+
+def alerta_fundo(preco: pd.Series, rsi: pd.Series, z_min: float = ALERTA_Z) -> pd.Series:
+    """Alerta em TEMPO REAL (só usa o passado): RSI diário < 35 e queda desde a máxima de 90 dias de pelo menos
+    2 desvios de 30 dias. Medir a queda em desvios (e não em %) adapta o alerta à fase: em alta calma, uma
+    queda menor já é "forte"; em baixa nervosa, precisa ser maior."""
+    z = _desvios(preco, preco.rolling("90D", min_periods=60).max())
+    return ((rsi < ALERTA_RSI) & (z <= -z_min)).fillna(False)
+
+
+def alerta_fundo_forte(preco: pd.Series, rsi: pd.Series) -> pd.Series:
+    """Mesmo alerta com queda de ≥ 3 desvios. Nas 31 criptos testadas: ~1/3 dos fundos têm esse alerta (contra ~3/4
+    do normal), mas o acerto em 7–30 dias quase dobra (+16 contra +9 pontos acima do acaso, em média)."""
+    return alerta_fundo(preco, rsi, FUNDO_FORTE_Z)
+
+
+def alerta_topo(preco: pd.Series, rsi: pd.Series, maxima: pd.Series | None = None,
+                minima: pd.Series | None = None) -> pd.Series:
+    """Alerta de topo por PERDA DE FORÇA (não por euforia): (a) divergência de baixa RSI × preço, ou (b) o preço
+    fechando abaixo da EMA50 depois de uma alta forte (≥ 2,5 desvios desde a mínima de 90 dias, nos 60 dias
+    anteriores). Euforia sozinha costuma continuar subindo; o topo só aparece quando o impulso quebra."""
+    z = _desvios(preco, preco.rolling("90D", min_periods=60).min())
+    euforia = z.rolling(f"{TOPO_DIAS}D", min_periods=1).max() >= TOPO_Z
+    ema = preco.ewm(span=TOPO_EMA, adjust=False).mean()
+    perdeu = (preco < ema) & (preco.shift(1) >= ema.shift(1)) & euforia
+    hi = preco if maxima is None else maxima
+    lo = preco if minima is None else minima
+    div = np.zeros(len(preco), dtype=bool)
+    dv = ln.divergencias(preco.to_numpy(float), lo.to_numpy(float), hi.to_numpy(float), rsi.to_numpy(float))
+    for conf in dv.loc[dv["tipo"] == "Bear", "confirmacao"]:
+        div[conf: conf + 3] = True                     # ativo 3 candles após a confirmação (como na aba Indicadores)
+    return (perdeu.fillna(False) | pd.Series(div, index=preco.index)).astype(bool)
+
+
+def depois_de(preco: pd.Series, inicios: list, dias: int = 60) -> dict:
+    """O que o preço fez nos `dias` seguintes a cada data: variação final, pior queda e maior alta."""
+    fim, pior, melhor = [], [], []
+    for t in inicios:
+        fut = preco.loc[t:t + pd.Timedelta(days=dias)]
+        if t + pd.Timedelta(days=dias) <= preco.index[-1]:
+            fim.append(fut.iloc[-1] / preco.loc[t] - 1)
+        pior.append(fut.min() / preco.loc[t] - 1)
+        melhor.append(fut.max() / preco.loc[t] - 1)
+    todos = (preco.shift(freq=f"-{dias}D").reindex(preco.index) / preco - 1).dropna()
+    f = np.array(fim)
+    return {"var_med": float(np.median(f)) if len(f) else np.nan, "subiu": float((f > 0).mean()) if len(f) else np.nan,
+            "caiu10": float((np.array(pior) <= -0.10).mean()) if pior else np.nan,
+            "subiu10": float((np.array(melhor) >= 0.10).mean()) if melhor else np.nan,
+            "base_med": float(todos.median()) if len(todos) else np.nan,
+            "base_subiu": float((todos > 0).mean()) if len(todos) else np.nan}
+
+
+def episodios(alerta: pd.Series, intervalo: int = 14) -> list[tuple]:
+    """Blocos de dias com alerta (separados por mais de `intervalo` dias sem alerta): [(início, fim), ...]."""
+    dias = alerta.index[alerta.to_numpy(bool)]
+    if not len(dias):
+        return []
+    blocos, ini, ant = [], dias[0], dias[0]
+    for t in dias[1:]:
+        if (t - ant).days > intervalo:
+            blocos.append((ini, ant))
+            ini = t
+        ant = t
+    blocos.append((ini, ant))
+    return blocos
+
+
+def avaliar_alerta(preco: pd.Series, alerta: pd.Series, tipo: str = "fundo") -> dict:
+    """Quantas vezes o alerta veio antes de um fundo (ou topo) de verdade — até 6 semanas depois do alerta."""
+    fundos, topos = extremos(preco)
+    alvos = fundos if tipo == "fundo" else topos
+    eps = episodios(alerta)
+    acertos, dias, mov = 0, [], []
+    for ini, fim in eps:
+        a = [f for f in alvos if ini - pd.Timedelta(days=14) <= f <= fim + pd.Timedelta(days=42)]
+        if a:
+            acertos += 1
+            dias.append((a[0] - ini).days)
+            mov.append(preco.loc[a[0]] / preco.loc[ini] - 1)
+    cobertos = sum(any(i - pd.Timedelta(days=14) <= f <= e + pd.Timedelta(days=42) for i, e in eps) for f in alvos)
+    pior = (min(mov) if tipo == "fundo" else max(mov)) if mov else np.nan
+    return {"episodios": eps, "n": len(eps), "acertos": acertos, "alvos": len(alvos), "fundos": len(alvos),
+            "cobertos": cobertos, **depois_de(preco, [e[0] for e in eps]),
+            "dias_med": float(np.median(dias)) if dias else np.nan,
+            "queda_med": float(np.median(mov)) if mov else np.nan, "queda_pior": float(pior) if mov else np.nan}
+
+
+# =========================================================================== #
+# Ranking dos métodos: mesma régua para todos os sinais do app
+# =========================================================================== #
+
+def avaliar_metodo(sinal: pd.Series, preco: pd.Series, prazo: int) -> dict:
+    """`sinal` diário: +1 = compra, −1 = venda, 0 = sem sinal. Acerto = o preço `prazo` dias depois andou para o
+    lado do sinal. 'Acaso' = quanto acertaria quem desse a MESMA quantidade de compras e vendas em dias sorteados
+    do mesmo período (num mercado que sobe 55% das vezes, só comprar já acerta 55%)."""
+    preco = preco.dropna()
+    sinal = sinal.reindex(preco.index).fillna(0)
+    ini = sinal.index[sinal.to_numpy() != 0].min() if (sinal != 0).any() else None
+    alvo = preco.index + pd.Timedelta(days=prazo)
+    fut = preco.reindex(alvo, method="ffill").to_numpy()
+    ok = alvo <= preco.index[-1]
+    ret = np.where(ok, fut / preco.to_numpy() - 1, np.nan)
+    d = pd.DataFrame({"s": sinal.to_numpy(), "ret": ret}, index=preco.index)
+    if ini is not None:
+        d = d[d.index >= ini]
+    d = d.dropna(subset=["ret"])
+    if d.empty or not (d["s"] != 0).any():
+        return {"n": 0}
+    sub = d["ret"] > 0
+    base = float(sub.mean())
+    c, v = d["s"] > 0, d["s"] < 0
+    acerto = (c & sub) | (v & ~sub)
+    n = int((c | v).sum())
+    acaso = (c.sum() * base + v.sum() * (1 - base)) / n
+    anos = []
+    for _, g in d.groupby(d.index.year):
+        gc, gv, gs = g["s"] > 0, g["s"] < 0, g["ret"] > 0
+        m = int((gc | gv).sum())
+        if m >= 20:
+            b_ = gs.mean()
+            anos.append(((gc & gs) | (gv & ~gs)).sum() / m - (gc.sum() * b_ + gv.sum() * (1 - b_)) / m)
+    return {"n": n, "inicio": d.index[0], "fim": d.index[-1], "dias": len(d), "cobertura": n / len(d),
+            "acerto": float(acerto.sum() / n), "acaso": float(acaso), "vantagem": float(acerto.sum() / n - acaso),
+            "n_compra": int(c.sum()), "n_venda": int(v.sum()),
+            "subiu_compra": float(sub[c].mean()) if c.any() else np.nan,
+            "caiu_venda": float((~sub[v]).mean()) if v.any() else np.nan,
+            "ret_compra": float(d.loc[c, "ret"].mean()) if c.any() else np.nan,
+            "ret_venda": float(d.loc[v, "ret"].mean()) if v.any() else np.nan,
+            "anos_bons": int(sum(a > 0 for a in anos)), "anos": len(anos), "base": base}
+
+
+def sinal_faixas(base_tok: pd.DataFrame, faixas: dict, cols: list[str], prazo: int, margem: float = 0.02,
+                 min_dias: int = 30) -> pd.DataFrame:
+    """A tabela 'cada indicador hoje e o que aconteceu nessa faixa', refeita em cada dia do passado com o que já
+    se sabia (resultados de pelo menos `prazo` dias antes). Média do 'Subiu %' das faixas de hoje acima do normal
+    (+`margem`) = COMPRA; abaixo (−`margem`) = VENDA."""
+    b = base_tok.sort_values("Date").reset_index(drop=True)
+    datas = b["Date"].to_numpy()
+    y = b["y"].to_numpy(float)
+    # o resultado do dia i passa a ser conhecido no 1º dia ≥ data_i + prazo + 1
+    conhecido = np.searchsorted(datas, datas + np.timedelta64(prazo + 1, "D"))
+    n = len(b)
+    ok = ~np.isnan(y) & (conhecido < n)
+    add_n = np.zeros(n)
+    add_y = np.zeros(n)
+    np.add.at(add_n, conhecido[ok], 1)
+    np.add.at(add_y, conhecido[ok], y[ok])
+    base_t = np.cumsum(add_y) / np.maximum(np.cumsum(add_n), 1)
+    taxas = []
+    for c in cols:
+        fx = faixas.get(c)
+        if fx is None:
+            continue
+        cod = codigos(b[c], fx)
+        nb = len(fx[2])
+        cn, cy = np.zeros((nb, n)), np.zeros((nb, n))
+        m = ok & (cod >= 0)
+        np.add.at(cn, (cod[m], conhecido[m]), 1)
+        np.add.at(cy, (cod[m], conhecido[m]), y[m])
+        cn, cy = cn.cumsum(axis=1), cy.cumsum(axis=1)
+        k = np.clip(cod, 0, None)
+        cnt, soma = cn[k, np.arange(n)], cy[k, np.arange(n)]
+        taxas.append(np.where((cod >= 0) & (cnt >= min_dias), soma / np.maximum(cnt, 1), np.nan))
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)          # dias sem nenhuma faixa com histórico
+        media = np.nanmean(np.vstack(taxas), axis=0) if taxas else np.full(n, np.nan)
+    sinal = np.where(media > base_t + margem, 1, np.where(media < base_t - margem, -1, 0))
+    return pd.DataFrame({"media": media, "normal": base_t, "sinal": sinal}, index=pd.DatetimeIndex(b["Date"]))
+
+
+def resumo_historico(h: pd.DataFrame, tarefa: str, token: str | None = None) -> dict:
+    """Notas do histórico (todos os ativos ou só um) + comportamento em fundos e topos."""
+    if h.empty:
+        return {}
+    d = h if token is None else h[h["token"] == token]
+    rot = d.dropna(subset=["y"])
+    alvo = "y" if tarefa == "cls" else "ret"
+    out = {"n": len(rot), "inicio": d["Date"].min(), "fim": d["Date"].max(),
+           "nota": nota(tarefa, rot[alvo], rot["p"]) if len(rot) > 30 else np.nan,
+           "subiu_todos": float(rot["y"].mean()) if len(rot) else np.nan}
+    anos = {}
+    for a, g in rot.groupby(rot["Date"].dt.year):
+        if len(g) > 60 and (tarefa != "cls" or g["y"].nunique() == 2):
+            anos[int(a)] = nota(tarefa, g[alvo], g["p"])
+    out["por_ano"] = anos
+    for lado in ("COMPRA", "VENDA"):
+        g = rot[rot["sinal"] == lado]
+        out[f"n_{lado}"] = len(g)
+        out[f"subiu_{lado}"] = float(g["y"].mean()) if len(g) else np.nan
+        out[f"ret_{lado}"] = float(np.expm1(g["ret"]).mean()) if len(g) else np.nan
+    ok = rot["ret_passado"].notna()
+    out["segue_tendencia"] = (float(spearmanr(rot.loc[ok, "p"], rot.loc[ok, "ret_passado"]).statistic)
+                              if ok.sum() > 30 and rot.loc[ok, "p"].std() > 0 else np.nan)
+    # fundos e topos, ativo por ativo
+    fases = []
+    for tok, g in d.groupby("token"):
+        s = g.set_index("Date")["preco"]
+        fases.append(pd.Series(viradas(s).to_numpy(), index=g.index))
+    d = d.assign(fase=pd.concat(fases)) if fases else d.assign(fase="meio")
+    out["fases"] = (d.groupby("fase")["sinal"].value_counts(normalize=True).unstack(fill_value=0) * 100).round(0)
+    out["dias_fase"] = d["fase"].value_counts().to_dict()
+    return out
+
+
+def sinal_confiavel(r: dict, tarefa: str) -> tuple[bool, bool]:
+    """(confiável, fraco) a partir do HISTÓRICO do sinal (retreinado mês a mês)."""
+    if not r or np.isnan(r.get("nota", np.nan)):
+        return False, False
+    if tarefa == "cls":
+        dif = r["subiu_COMPRA"] - r["subiu_VENDA"] if r["n_COMPRA"] and r["n_VENDA"] else np.nan
+        bom = r["nota"] >= 0.53 and dif >= 0.05
+        fraco = r["nota"] >= 0.51 and dif >= 0.02
+    else:
+        bom = r["nota"] >= 0.05 and r["ret_COMPRA"] > r["ret_VENDA"]
+        fraco = r["nota"] >= 0.02 and r["ret_COMPRA"] > r["ret_VENDA"]
+    pior_ano = min(r["por_ano"].values()) if r["por_ano"] else np.nan
+    if bom and not np.isnan(pior_ano) and pior_ano < ACASO[tarefa] - (0.03 if tarefa == "cls" else 0.05):
+        bom = False                                   # bom na média, mas com anos claramente invertidos
+    return bool(bom), bool(fraco)
+
+
+def _precos(v) -> list[str]:
+    """Preço de fechamento formatado para o texto do mouse (o marcador fica deslocado do preço no gráfico)."""
+    return [ln.fmt(float(x)) for x in np.asarray(v, dtype=float)]
+
+
+def fig_historico(h: pd.DataFrame, token: str, tarefa: str, moeda: str = "USD") -> go.Figure:
+    """Preço do ativo com o sinal que o modelo teria dado em cada dia."""
+    d = h[h["token"] == token].sort_values("Date")
+    fig = go.Figure(go.Scatter(x=d["Date"], y=d["preco"], name="Preço", line=dict(color="#e0e0e0", width=1.3),
+                               hoverinfo="skip"))
+    cores = {"COMPRA": "#26a69a", "VENDA": "#ef5350", "neutro": "#616161"}
+    for lado, cor in cores.items():
+        g = d[d["sinal"] == lado]
+        if g.empty:
+            continue
+        txt = (100 * g["p"]).round(0).astype(int).astype(str) + "% de chance de alta" if tarefa == "cls" else \
+            (100 * np.expm1(g["p"])).round(1).astype(str) + "% previsto"
+        fig.add_trace(go.Scattergl(x=g["Date"], y=g["preco"], mode="markers", name=lado,
+                                   marker=dict(color=cor, size=4 if lado == "neutro" else 6),
+                                   text=txt, customdata=_precos(g["preco"]),
+                                   hovertemplate="%{x|%d/%m/%Y} · " + moeda + " %{customdata}: " + lado +
+                                                 " · %{text}<extra></extra>"))
+    fases = viradas(d.set_index("Date")["preco"])
+    for nome, simb, cor in (("fundo", "triangle-up", "#26a69a"), ("topo", "triangle-down", "#ef5350")):
+        # um marcador por fundo/topo (no dia extremo de cada trecho)
+        f = d.assign(fase=fases.to_numpy())
+        f = f[f["fase"] == nome]
+        if f.empty:
+            continue
+        grupo = (f["Date"].diff() > pd.Timedelta(days=3)).cumsum()
+        pts = f.loc[f.groupby(grupo)["preco"].idxmin() if nome == "fundo" else f.groupby(grupo)["preco"].idxmax()]
+        fig.add_trace(go.Scatter(x=pts["Date"], y=pts["preco"] * (0.9 if nome == "fundo" else 1.1), mode="markers",
+                                 name=f"{nome} (visto depois)", marker=dict(symbol=simb, size=11, color=cor,
+                                                                           line=dict(color="#fff", width=1)),
+                                 text=_precos(pts["preco"]),
+                                 hovertemplate="%{x|%d/%m/%Y} · " + moeda + " %{text}: " + nome + "<extra></extra>"))
+    if "rsi" in d:
+        alerta = alerta_fundo(d.set_index("Date")["preco"], d.set_index("Date")["rsi"])
+        forte = alerta_fundo_forte(d.set_index("Date")["preco"], d.set_index("Date")["rsi"])
+        ini = [e[0] for e in episodios(alerta)]
+        ini_f = [e[0] for e in episodios(forte)]
+        if ini:
+            px_ = d.set_index("Date")["preco"].loc[ini]
+            fig.add_trace(go.Scatter(x=ini, y=px_ * 0.82, mode="markers", name="alerta de fundo (na hora)",
+                                     marker=dict(symbol="diamond", size=9, color="#ffb300", line=dict(color="#000", width=1)),
+                                     text=_precos(px_), hovertemplate="%{x|%d/%m/%Y} · " + moeda + " %{text}: alerta de fundo — RSI diário < " + str(ALERTA_RSI) +
+                                                   f" e queda de ≥ {ALERTA_Z:g} desvios<extra></extra>"))
+        if ini_f:
+            px_ = d.set_index("Date")["preco"].loc[ini_f]
+            fig.add_trace(go.Scatter(x=ini_f, y=px_ * 0.70, mode="markers", name="alerta de fundo FORTE",
+                                     marker=dict(symbol="diamond", size=13, color="#ff3d00", line=dict(color="#fff", width=1)),
+                                     text=_precos(px_), hovertemplate="%{x|%d/%m/%Y} · " + moeda + " %{text}: alerta de fundo FORTE — RSI diário < " + str(ALERTA_RSI) +
+                                                   f" e queda de ≥ {FUNDO_FORTE_Z:g} desvios<extra></extra>"))
+        di = d.set_index("Date")
+        ini_t = [e[0] for e in episodios(alerta_topo(di["preco"], di["rsi"], di.get("maxima"), di.get("minima")))]
+        if ini_t:
+            px_ = d.set_index("Date")["preco"].loc[ini_t]
+            fig.add_trace(go.Scatter(x=ini_t, y=px_ * 1.22, mode="markers", name="alerta de topo (na hora)",
+                                     marker=dict(symbol="diamond", size=9, color="#d500f9", line=dict(color="#000", width=1)),
+                                     text=_precos(px_), hovertemplate="%{x|%d/%m/%Y} · " + moeda + " %{text}: alerta de topo — perda de força (divergência de "
+                                                   "baixa ou perdeu a EMA" + str(TOPO_EMA) + " depois de euforia)<extra></extra>"))
+    fig.update_layout(template="plotly_dark", height=420, hovermode="closest", yaxis_type="log",
+                      yaxis_title=f"Preço ({moeda}, escala log)", margin=dict(l=60, r=20, t=30, b=30),
+                      legend=dict(orientation="h", y=1.02, x=0, yanchor="bottom"))
+    return fig
+
+
 def leitura_token(res: dict, base: pd.DataFrame, token: str) -> pd.DataFrame:
-    """Valor de cada indicador agora, a faixa e o que aconteceu historicamente nela."""
+    """Valor de cada indicador agora, a faixa e o que aconteceu historicamente nela — no histórico do
+    próprio ativo e, se o modelo usa vários ativos, também em todos juntos (os comportamentos diferem)."""
     if token not in res["valores_agora"].index:
         return pd.DataFrame()
     v = res["valores_agora"].loc[token]
     y = base["y"].to_numpy()
     r = np.expm1(base["ret"].to_numpy())
     ok = ~np.isnan(y)
+    do_tok = (base["token"] == token).to_numpy()
+    varios = base["token"].nunique() > 1
     linhas = []
     for c in res["cols_todas"]:
         fx = res["faixas"].get(c)
         if fx is None or pd.isna(v[c]):
-            linhas.append((NOME[c], GRUPO[c], "—", "sem dado", np.nan, np.nan, 0))
+            linhas.append((NOME[c], GRUPO[c], "—", "sem dado") + (np.nan, np.nan, 0) * (2 if varios else 1))
             continue
         k = res["cods_agora"][token][c]
-        m = ok & (codigos(base[c], fx) == k)
+        na_faixa = ok & (codigos(base[c], fx) == k)
         val = fx[2][k] if fx[0] == "cat" else _fmt_num(float(v[c]), INDICADORES[c][2])
-        linhas.append((NOME[c], GRUPO[c], val, fx[2][k], 100 * y[m].mean() if m.any() else np.nan,
-                       100 * r[m].mean() if m.any() else np.nan, int(m.sum())))
-    return pd.DataFrame(linhas, columns=["Indicador", "Grupo", "Agora", "Faixa", "Subiu % nessa faixa",
-                                         "Variação média %", "Dias"])
+        lin = (NOME[c], GRUPO[c], val, fx[2][k])
+        for m in ([na_faixa & do_tok, na_faixa] if varios else [na_faixa]):
+            lin += (100 * y[m].mean() if m.any() else np.nan, 100 * r[m].mean() if m.any() else np.nan, int(m.sum()))
+        linhas.append(lin)
+    nomes = ["Indicador", "Grupo", "Agora", "Faixa"]
+    if varios:
+        nomes += [f"Subiu % ({token})", f"Variação média % ({token})", f"Dias ({token})",
+                  "Subiu % (todos)", "Variação média % (todos)", "Dias (todos)"]
+    else:
+        nomes += ["Subiu % nessa faixa", "Variação média %", "Dias"]
+    return pd.DataFrame(linhas, columns=nomes)
 
 
 def mapa_par(base: pd.DataFrame, res: dict, a: str, b: str, periodo: str = "todo") -> dict:
@@ -641,7 +1080,7 @@ def mapa_par(base: pd.DataFrame, res: dict, a: str, b: str, periodo: str = "todo
     r = base["ret"].to_numpy()
     m = ~np.isnan(r) & (ca >= 0) & (cb >= 0)
     if periodo != "todo":
-        _, dev, te, _ = dividir(base["Date"], 1)
+        _, dev, te, _, _ = dividir(base["Date"], 1)
         m &= dev if periodo == "antes" else te
     na, nb = len(fa[2]), len(fb[2])
     k = ca[m] * nb + cb[m]
