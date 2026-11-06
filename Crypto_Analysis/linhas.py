@@ -39,7 +39,7 @@ uma fração do ATR. No RSI a tolerância é em pontos.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import replace, dataclass, asdict
 
 import numpy as np
 import pandas as pd
@@ -680,6 +680,109 @@ def sinais_linhas(res: dict, n: int, p: ParamsLinhas) -> pd.DataFrame:
     out["_tipo"] = out["Sinal"].str.replace(r"\s*\(score.*$", "", regex=True)
     out = out.sort_values("Força", ascending=False).drop_duplicates("_tipo").drop(columns="_tipo")
     return out.reset_index(drop=True)
+
+
+def eventos_sinal(df: pd.DataFrame, p: ParamsLinhas = ParamsLinhas()) -> pd.DataFrame:
+    """Histórico CAUSAL dos sinais de linhas do preço (para o ranking de métodos). Cada evento entra no candle em
+    que já seria visível: toque em LTA/suporte ativo (+1) ou em LTB/resistência (−1); rompimento de LTB ↑ (+1) ou
+    de LTA ↓ (−1); reteste da linha rompida (lado do rompimento); rompimento falso (lado contrário); divergência
+    RSI × preço (+1 de alta, −1 de baixa). Usa todas as linhas candidatas, não só as mais fortes do gráfico.
+    `toques` = quantos toques a linha já tinha (confirmados) no candle do evento ou do rompimento."""
+    df = df.dropna(subset=["Close"])
+    H, L, C, tol, _ = _series(df, "preco", p)
+    n = len(C)
+    ev = []
+    for tipo, x, k in (("sup", L, "baixo"), ("res", H, "alto")):
+        idx, prom = pivos(x, p.esquerda, p.direita, k)
+        keep = prom >= p.prom_min * tol[idx] if idx.size else np.array([], bool)
+        s = 1 if tipo == "sup" else -1
+        for Lc in _candidatas(x, C, tol, idx[keep], x[idx[keep]], tipo, p):
+            ini = Lc["j"] + p.direita + 1                       # a linha só existe depois do 2º pivô confirmado
+            b = Lc["brk"]
+            fim = b if b >= 0 else n
+            tq = np.sort(np.asarray(Lc["toques_idx"])) + p.direita   # quando cada toque fica confirmado
+            nt = lambda t_: int(np.searchsorted(tq, t_, side="right"))   # noqa: E731  toques conhecidos em t_
+            if ini < fim:
+                t = np.arange(ini, fim)
+                zona = s * (x[t] - _valor(Lc, t)) / tol[t] <= 1.0
+                entrada = zona & ~np.concatenate(([True], zona[:-1]))
+                ev += [(int(te), s, "toque", nt(te)) for te in t[entrada]]
+            if b > Lc["j"] + p.direita:
+                k_b = nt(b)
+                ev.append((int(b), -s, "rompimento", k_b))
+                pos = _pos_rompimento(Lc, H, L, C, tol)
+                ev += [(int(r), -s, "reteste", k_b) for r in pos["retestes"] if r - b <= p.janela_reteste]
+                if pos["inval"] >= 0:
+                    ev.append((int(pos["inval"]), s, "rompimento falso", k_b))
+    r = df["RSI"] if "RSI" in df.columns else rsi_wilder(df["Close"])
+    div = divergencias(df["Close"].to_numpy(float), df["Low"].to_numpy(float), df["High"].to_numpy(float),
+                       r.to_numpy(float), p.esquerda, p.direita)
+    ev += [(int(d.confirmacao), 1 if d.tipo == "Bull" else -1, "divergência", 0) for d in div.itertuples()
+           if d.confirmacao < n]
+    e = pd.DataFrame(ev, columns=["t", "lado", "evento", "toques"]).drop_duplicates()
+    e["Date"] = df.index[e["t"].to_numpy()] if len(e) else pd.Series(dtype="datetime64[ns]")
+    return e
+
+
+def rompimentos(df: pd.DataFrame, p: ParamsLinhas = ParamsLinhas()) -> pd.DataFrame:
+    """Rompimentos CAUSAIS de todas as linhas candidatas, com quantos toques a linha já tinha (pivôs perto dela já
+    confirmados) no candle do rompimento. lado = +1 (rompeu LTB/resistência para cima) ou −1 (perdeu LTA/suporte)."""
+    df = df.dropna(subset=["Close"])
+    H, L, C, tol, _ = _series(df, "preco", p)
+    ev = []
+    for tipo, x, k in (("sup", L, "baixo"), ("res", H, "alto")):
+        idx, prom = pivos(x, p.esquerda, p.direita, k)
+        piv = idx[prom >= p.prom_min * tol[idx]] if idx.size else idx
+        for Lc in _candidatas(x, C, tol, piv, x[piv], tipo, p):
+            b = Lc["brk"]
+            if b > Lc["j"] + p.direita:
+                toques = int(np.sum(np.asarray(Lc["toques_idx"]) + p.direita <= b))
+                ev.append((int(b), 1 if tipo == "res" else -1, toques))
+    e = pd.DataFrame(ev, columns=["t", "lado", "toques"])
+    e["Date"] = df.index[e["t"].to_numpy()] if len(e) else pd.Series(dtype="datetime64[ns]")
+    return e
+
+
+TEND_TOQUES = 3        # só linhas com pelo menos 3 toques (2 âncoras + 1 confirmação) antes do rompimento
+TEND_VALIDADE = 30     # dias em que um rompimento no diário continua valendo
+
+
+def _estado(e: pd.DataFrame, idx: pd.DatetimeIndex, validade: int | None = None) -> pd.Series:
+    """Lado do último rompimento, mantido até um rompimento do lado contrário (ou até `validade` dias)."""
+    s = pd.Series(np.nan, index=idx)
+    g = e[e["Date"].isin(idx)].groupby("Date")["lado"].sum()
+    g = np.sign(g[g != 0])
+    s.loc[g.index] = g.to_numpy()
+    st_ = s.ffill().fillna(0)
+    if validade is not None:
+        ult = pd.Series(idx.where(s.notna()), index=idx).ffill()
+        st_ = st_.where((pd.Series(idx, index=idx) - ult).dt.days <= validade, 0)
+    return st_.astype(int)
+
+
+def tendencia_linhas(diario: pd.DataFrame, p: ParamsLinhas = ParamsLinhas(), toques_min: int = TEND_TOQUES,
+                     validade: int = TEND_VALIDADE) -> pd.DataFrame:
+    """Leitura agregada das linhas, como na análise manual: a TENDÊNCIA vem do último rompimento de uma linha
+    relevante (≥ `toques_min` toques) no gráfico SEMANAL, e o diário precisa CONFIRMAR com um rompimento recente
+    (≤ `validade` dias) do mesmo lado. COMPRA = os dois para cima; VENDA = os dois para baixo; senão, sem sinal.
+    Testado no BTC (2015–2026): toques em LTA/suporte como sinal de compra (e em LTB/resistência como venda)
+    erraram mais que o acaso em todos os prazos, por isso não entram; os rompimentos é que funcionam."""
+    d = diario.dropna(subset=["Close"])
+    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+    sem = d.resample("W-MON", label="left", closed="left").agg(agg).dropna(subset=["Close"])
+    rd = rompimentos(d, p)
+    rw = rompimentos(sem, replace(p, gap_min=4, span_max=150))
+    rw["Date"] = rw["Date"] + pd.Timedelta(days=7)          # o candle semanal só fecha 7 dias depois do rótulo
+    rd, rw = rd[rd["toques"] >= toques_min], rw[rw["toques"] >= toques_min]
+    idx = d.index
+    rw_d = rw.assign(Date=idx[np.minimum(idx.searchsorted(rw["Date"]), len(idx) - 1)])[rw["Date"] <= idx[-1]]
+    s_w, s_d = _estado(rw_d, idx), _estado(rd, idx, validade)
+    sinal = np.where((s_w == s_d) & (s_w != 0), s_w, 0)
+    ult = lambda e, lado: e.loc[e["lado"] == lado, "Date"].max() if (e["lado"] == lado).any() else pd.NaT  # noqa: E731
+    out = pd.DataFrame({"semanal": s_w, "diario": s_d, "sinal": sinal}, index=idx)
+    out.attrs = {"ult_sem_alta": ult(rw_d, 1), "ult_sem_baixa": ult(rw_d, -1),
+                 "ult_dia_alta": ult(rd, 1), "ult_dia_baixa": ult(rd, -1)}
+    return out
 
 
 def analisar(df: pd.DataFrame, p: ParamsLinhas = ParamsLinhas(), backtest: bool = False) -> dict:
