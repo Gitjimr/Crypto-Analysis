@@ -1,4 +1,3 @@
-
 import functools
 import json
 import os
@@ -29,7 +28,7 @@ for _k in list(st.session_state.keys()):
     if not str(_k).startswith("FormSubmitter:"):
         st.session_state[_k] = st.session_state[_k]
 
-PERIODO = "max"      # baixa todo o histórico (mais dados para o ML e para EMAs longas)
+ANOS_PADRAO = 30     # por padrão, só os últimos 30 anos (ações dos EUA têm dados desde os anos 60–80: fica pesado)
 MESES_GRAFICO = 36   # período exibido por padrão nos gráficos (o mesmo do app original)
 TTL = "30m"          # tempo de vida do cache de dados de mercado
 
@@ -2061,6 +2060,12 @@ with st.sidebar:
     mercado = st.radio("Mercado", list(MERCADOS), horizontal=True,
                        help="Cripto = lista do add_symbols.txt (cotação em USD). Ações B3 em BRL e Ações EUA em "
                             "USD = listas ACOES_B3 / ACOES_EUA no início do código.")
+    so_recentes = st.checkbox(f"Só os últimos {ANOS_PADRAO} anos", value=True,
+                              help=f"Marcado (padrão): baixa e analisa só os últimos {ANOS_PADRAO} anos de cada ativo — mais "
+                                   "leve, principalmente para ações dos EUA, que têm dados desde os anos 60–80. "
+                                   "Desmarcado: usa todo o histórico de todos os ativos (cripto quase não muda: o "
+                                   "histórico delas é mais curto que isso).")
+    periodo_dados = f"{ANOS_PADRAO}y" if so_recentes else "max"
     usar_ultima = st.checkbox("Usar última data", value=True, help="Se desmarcado, selecionar última data")
     data_maxima = None if usar_ultima else st.date_input(
         "Selecione última data", value=pd.Timestamp.today().date(), format="DD/MM/YYYY").isoformat()
@@ -2069,7 +2074,7 @@ with st.sidebar:
 
 lista = {"Cripto": simbolos, "Ações B3": ACOES_B3, "Ações EUA": ACOES_EUA}[mercado]
 moeda = MERCADOS[mercado]
-chave = (lista, PERIODO, data_maxima, mercado)
+chave = (lista, periodo_dados, data_maxima, mercado)
 dados = preparar_dados(*chave)
 tokens = list(dados["1D"])
 if not tokens:
